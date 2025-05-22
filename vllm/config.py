@@ -4075,6 +4075,10 @@ class VllmConfig:
     you are using. Contents must be hashable."""
     instance_id: str = ""
     """The ID of the vLLM instance."""
+    log_dir: str = "./logs"
+    """The directory to store the logs."""
+    collect_experts: bool = False
+    """Whether to collect experts for the model."""
 
     def compute_hash(self) -> str:
         """

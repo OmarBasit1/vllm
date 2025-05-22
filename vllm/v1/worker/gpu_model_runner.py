@@ -84,6 +84,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.speculative_config = vllm_config.speculative_config
         self.prompt_adapter_config = vllm_config.prompt_adapter_config
         self.observability_config = vllm_config.observability_config
+        self.collect_experts = vllm_config.collect_experts
+        print(f"collect_experts: {self.collect_experts}")
 
         from vllm.model_executor.models.utils import set_cpu_offload_max_bytes
         set_cpu_offload_max_bytes(
@@ -1192,7 +1194,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 intermediate_tensors=intermediate_tensors,
                 inputs_embeds=inputs_embeds,
             )
-
+            
             self.maybe_wait_for_kv_save()
             finished_sending, finished_recving = (
                 self.get_finished_kv_transfers(scheduler_output))
@@ -1200,7 +1202,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.use_aux_hidden_state_outputs:
             hidden_states, aux_hidden_states = model_output
         else:
-            hidden_states = model_output
+            hidden_states, experts = model_output
+            print("experts", experts)
         # Broadcast PP output for external_launcher (torchrun)
         # to make sure we are synced across pp ranks
         # TODO: Support overlapping mirco-batches
@@ -1706,7 +1709,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs
             else:
-                hidden_states = outputs
+                hidden_states, experts = outputs
 
             if self.use_spec_decode and \
                 self.speculative_config.method in ('eagle', 'eagle3'):

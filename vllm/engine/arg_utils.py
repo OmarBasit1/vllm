@@ -420,6 +420,11 @@ class EngineArgs:
     use_tqdm_on_load: bool = LoadConfig.use_tqdm_on_load
     pt_load_map_location: str = LoadConfig.pt_load_map_location
 
+    # added args
+    log_dir: str = "./logs"
+    collect_experts: bool = False
+    
+
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
         # without having to manually construct a
@@ -849,6 +854,13 @@ class EngineArgs:
         parser.add_argument('--disable-log-stats',
                             action='store_true',
                             help='Disable logging statistics.')
+        # added arguments
+        parser.add_argument("--log-dir", default='./logs')
+        parser.add_argument('--collect-experts',
+                            action='store_true',
+                            default=False,
+                            help='Collect expert IDs at each layer.')
+        
 
         return parser
 
@@ -1185,6 +1197,8 @@ class EngineArgs:
             kv_transfer_config=self.kv_transfer_config,
             kv_events_config=self.kv_events_config,
             additional_config=self.additional_config,
+            log_dir=self.log_dir,
+            collect_experts=self.collect_experts,
         )
 
         return config

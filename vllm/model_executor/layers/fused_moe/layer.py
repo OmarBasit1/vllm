@@ -510,7 +510,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
                 activation=activation,
-                apply_router_weight_on_input=apply_router_weight_on_input)
+                apply_router_weight_on_input=apply_router_weight_on_input), topk_ids
         else:
             return self.fused_experts(
                 hidden_states=x,
@@ -523,7 +523,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 apply_router_weight_on_input=apply_router_weight_on_input,
                 global_num_experts=global_num_experts,
                 expert_map=expert_map,
-            )
+            ), topk_ids
 
     def forward_cpu(
         self,
