@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
+import csv
 import gc
+import os
 import time
 import weakref
 from typing import TYPE_CHECKING, Optional, Union
@@ -85,7 +87,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.prompt_adapter_config = vllm_config.prompt_adapter_config
         self.observability_config = vllm_config.observability_config
         self.collect_experts = vllm_config.collect_experts
-        print(f"collect_experts: {self.collect_experts}")
 
         from vllm.model_executor.models.utils import set_cpu_offload_max_bytes
         set_cpu_offload_max_bytes(
@@ -1136,6 +1137,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.vllm_config.compilation_config.pass_config. \
                 enable_sequence_parallelism and tp_size > 1:
                 from vllm.utils import round_up
+
                 num_input_tokens = round_up(num_scheduled_tokens, tp_size)
             else:
                 num_input_tokens = num_scheduled_tokens
@@ -1194,7 +1196,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 intermediate_tensors=intermediate_tensors,
                 inputs_embeds=inputs_embeds,
             )
-            
+
             self.maybe_wait_for_kv_save()
             finished_sending, finished_recving = (
                 self.get_finished_kv_transfers(scheduler_output))
@@ -1203,7 +1205,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states, aux_hidden_states = model_output
         else:
             hidden_states, experts = model_output
-            print("experts", experts)
+            experts = [expert.cpu().tolist() for expert in experts]
+            # print(f"Experts: {experts}")
+            # Create a CSV file with the filename as the current timestamp
+            csv_filename = "experts_logs/granite_burst_experts.csv"
+            os.makedirs(os.path.dirname(csv_filename), exist_ok=True)
+            if not os.path.exists(csv_filename):
+                open(csv_filename, "w").close()
+            # Write the experts data to the CSV file and flush to disk
+            with open(csv_filename, mode="a", newline="") as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(self.input_batch.req_ids)
+                writer.writerow(experts)
         # Broadcast PP output for external_launcher (torchrun)
         # to make sure we are synced across pp ranks
         # TODO: Support overlapping mirco-batches
