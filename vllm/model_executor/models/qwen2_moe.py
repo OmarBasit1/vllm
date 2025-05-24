@@ -151,15 +151,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        final_hidden_states = self.experts(hidden_states=hidden_states,
-                                           router_logits=router_logits)
+        final_hidden_states, chosen_experts = self.experts(
+            hidden_states=hidden_states, router_logits=router_logits)
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
         if self.tp_size > 1:
             final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(  # noqa E501
                 final_hidden_states)
 
-        return final_hidden_states.view(orig_shape)
+        return final_hidden_states.view(orig_shape), chosen_experts
 
 
 class Qwen2MoeAttention(nn.Module):
@@ -326,8 +326,8 @@ class Qwen2MoeDecoderLayer(nn.Module):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
-        return hidden_states, residual
+        hidden_states, chosen_experts = self.mlp(hidden_states)
+        return hidden_states, residual, chosen_experts
 
 
 @support_torch_compile
@@ -380,15 +380,18 @@ class Qwen2MoeModel(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
+        experts = []
         for layer in self.layers[self.start_layer:self.end_layer]:
-            hidden_states, residual = layer(positions, hidden_states, residual)
+            hidden_states, residual, active_expert = layer(
+                positions, hidden_states, residual)
+            experts.append(active_expert)
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
                 "hidden_states": hidden_states,
                 "residual": residual
             })
         hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+        return hidden_states, experts
 
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
