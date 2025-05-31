@@ -97,7 +97,8 @@ class GraniteMoeMoE(nn.Module):
         hidden_states = hidden_states.view(-1, self.hidden_size)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        final_hidden_states, chosen_experts = self.experts(hidden_states, router_logits)
+        final_hidden_states, chosen_experts = self.experts(
+            hidden_states, router_logits)
         return final_hidden_states.view(orig_shape), chosen_experts
 
 

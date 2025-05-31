@@ -423,7 +423,6 @@ class EngineArgs:
     # added args
     log_dir: str = "./logs"
     collect_experts: bool = False
-    
 
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
@@ -860,7 +859,6 @@ class EngineArgs:
                             action='store_true',
                             default=False,
                             help='Collect expert IDs at each layer.')
-        
 
         return parser
 

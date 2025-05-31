@@ -510,7 +510,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
                 activation=activation,
-                apply_router_weight_on_input=apply_router_weight_on_input), topk_ids
+                apply_router_weight_on_input=apply_router_weight_on_input
+            ), topk_ids
         else:
             return self.fused_experts(
                 hidden_states=x,

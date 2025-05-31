@@ -1204,19 +1204,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.use_aux_hidden_state_outputs:
             hidden_states, aux_hidden_states = model_output
         else:
-            hidden_states, experts = model_output
-            experts = [expert.cpu().tolist() for expert in experts]
-            # print(f"Experts: {experts}")
-            # Create a CSV file with the filename as the current timestamp
-            csv_filename = "experts_logs/granite_burst_experts.csv"
-            os.makedirs(os.path.dirname(csv_filename), exist_ok=True)
-            if not os.path.exists(csv_filename):
-                open(csv_filename, "w").close()
-            # Write the experts data to the CSV file and flush to disk
-            with open(csv_filename, mode="a", newline="") as csvfile:
-                writer = csv.writer(csvfile)
-                writer.writerow(self.input_batch.req_ids)
-                writer.writerow(experts)
+            reports_chosen_experts = isinstance(model_output, tuple)
+            if not reports_chosen_experts:
+                hidden_states = model_output
+            else:
+                hidden_states, experts = model_output
+                experts = [expert.cpu().tolist() for expert in experts]
+                # print(f"Experts: {experts}")
+                # Create a CSV file with the filename as the current timestamp
+                csv_filename = "experts_logs/granite_burst_experts.csv"
+                os.makedirs(os.path.dirname(csv_filename), exist_ok=True)
+                if not os.path.exists(csv_filename):
+                    open(csv_filename, "w").close()
+                # Write the experts data to the CSV file and flush to disk
+                with open(csv_filename, mode="a", newline="") as csvfile:
+                    writer = csv.writer(csvfile)
+                    writer.writerow(self.input_batch.req_ids)
+                    writer.writerow(experts)
         # Broadcast PP output for external_launcher (torchrun)
         # to make sure we are synced across pp ranks
         # TODO: Support overlapping mirco-batches
@@ -1722,7 +1726,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs
             else:
-                hidden_states, experts = outputs
+                reports_chosen_experts = isinstance(outputs, tuple)
+                if reports_chosen_experts:
+                    hidden_states, _ = outputs
+                else:
+                    hidden_states = outputs
 
             if self.use_spec_decode and \
                 self.speculative_config.method in ('eagle', 'eagle3'):
