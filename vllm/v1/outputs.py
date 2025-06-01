@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from dataclasses import dataclass
-from typing import NamedTuple, Optional
+from dataclasses import asdict, dataclass
+from typing import Any, NamedTuple, Optional
 
 import torch
 
@@ -60,6 +60,29 @@ class LogprobsTensors(NamedTuple):
 
 
 @dataclass
+class MoEBlockProfilingResult:
+    # All times are relative to the start of the MoE block
+    time_dispatch_end: float
+    time_mlp_end: float
+    time_combine_end: float
+    topk_ids: list[list[int]]  # [num_tokens_in_batch, k]
+
+
+MoEModelProfilingResult = list[MoEBlockProfilingResult]
+
+
+def moe_model_profiling_result_to_dict(
+        model_result: MoEModelProfilingResult) -> dict:
+    """
+    Append each key with block layer id.
+    """
+    ret: dict[str, Any] = {}
+    for i, block_result in enumerate(model_result):
+        ret |= {f'{k}_{i}': v for k, v in asdict(block_result).items()}
+    return ret
+
+
+@dataclass
 class SamplerOutput:
 
     # [num_reqs, max_num_generated_tokens]
@@ -103,6 +126,8 @@ class ModelRunnerOutput:
     # [req_ids]
     finished_sending: Optional[set[str]] = None
     finished_recving: Optional[set[str]] = None
+
+    moe_model_profiling_result: Optional[MoEModelProfilingResult] = None
 
 
 EMPTY_MODEL_RUNNER_OUTPUT = ModelRunnerOutput(req_ids=[],

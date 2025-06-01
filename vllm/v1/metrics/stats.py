@@ -4,6 +4,7 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
+from vllm.v1.outputs import MoEModelProfilingResult
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
 if TYPE_CHECKING:
@@ -92,6 +93,8 @@ class IterationStats:
         self.time_per_output_tokens_iter: list[float] = []
         self.waiting_lora_adapters: dict[str, int] = {}
         self.running_lora_adapters: dict[str, int] = {}
+        self.moe_model_profiling_result: Optional[
+            MoEModelProfilingResult] = None
 
     def _time_since(self, start: float) -> float:
         """Calculate an interval relative to this iteration's timestamp."""

@@ -1,11 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import atexit
 import logging
+import threading
 import time
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Callable, Optional
 
 import numpy as np
+import pandas as pd
 import prometheus_client
 
 from vllm.config import SupportsMetricsInfo, VllmConfig
@@ -13,6 +18,7 @@ from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_utils import PrefixCachingMetrics
 from vllm.v1.engine import FinishReason
 from vllm.v1.metrics.stats import IterationStats, SchedulerStats
+from vllm.v1.outputs import moe_model_profiling_result_to_dict
 from vllm.v1.spec_decode.metrics import SpecDecodingLogging, SpecDecodingProm
 
 logger = init_logger(__name__)
@@ -456,6 +462,71 @@ class PrometheusStatLogger(StatLoggerBase):
         self.log_metrics_info("cache_config", self.vllm_config.cache_config)
 
 
+class CSVLogger(StatLoggerBase):
+    """
+    Logs to CSV. Writes are incremental to avoid blocking.
+    """
+
+    def __init__(self, vllm_config: VllmConfig, engine_index: int = 0) -> None:
+        self.filename = Path(
+            vllm_config.log_dir) / f'engine_{engine_index}.csv'
+        self.persist_to_disk_every = 10
+
+        self.filename.parent.mkdir(parents=True, exist_ok=True)
+        if self.filename.exists():
+            self.filename.unlink()
+        self.iter = 0
+        self.csv_buf: list[dict] = []
+        self.buf_lock = threading.Lock()
+        self.executor = ThreadPoolExecutor(max_workers=1)
+
+        atexit.register(self._flush_remaining_sync)
+
+    def increment_counter_and_maybe_persist_to_disk(self):
+        self.iter += 1
+        if self.iter % self.persist_to_disk_every == 0:
+            self.persist_to_disk()
+
+    def persist_to_disk(self):
+        with self.buf_lock:
+            data_to_write = self.csv_buf.copy()
+            self.csv_buf.clear()
+
+        if not data_to_write:
+            return
+
+        self.executor.submit(self._write_to_csv, data_to_write)
+
+    def _write_to_csv(self, data: list[dict]):
+        file_exists = self.filename.exists()
+        pd.DataFrame(data).to_csv(self.filename,
+                                  mode='a',
+                                  header=not file_exists,
+                                  index=False)
+        logger.info("CSVLogger persisted %d entries to disk", len(data))
+
+    def record(self, scheduler_stats: SchedulerStats,
+               iteration_stats: Optional[IterationStats]):
+        with self.buf_lock:
+            if iteration_stats and iteration_stats.moe_model_profiling_result:
+                self.csv_buf.append(
+                    moe_model_profiling_result_to_dict(
+                        iteration_stats.moe_model_profiling_result))
+        self.increment_counter_and_maybe_persist_to_disk()
+
+    def log_engine_initialized(self):
+        pass
+
+    def _flush_remaining_sync(self):
+        with self.buf_lock:
+            data_to_write = self.csv_buf.copy()
+            self.csv_buf.clear()
+
+        if data_to_write:
+            self._write_to_csv(data_to_write)
+        self.executor.shutdown(wait=True)
+
+
 def build_buckets(mantissa_lst: list[int], max_value: int) -> list[int]:
     """
     Builds a list of buckets with increasing powers of 10 multiplied by
@@ -500,6 +571,7 @@ def setup_default_loggers(
         factories = [PrometheusStatLogger]
         if logger.isEnabledFor(logging.INFO):
             factories.append(LoggingStatLogger)
+        factories.append(CSVLogger)
 
     stat_loggers: list[list[StatLoggerBase]] = []
     for i in range(engine_num):

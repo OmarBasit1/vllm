@@ -392,6 +392,9 @@ class AsyncLLM(EngineClient):
                     # 4) Logging.
                     # TODO(rob): make into a coroutine and launch it in
                     # background thread once Prometheus overhead is non-trivial.
+                    if iteration_stats:
+                        iteration_stats.moe_model_profiling_result \
+                                = outputs.moe_model_profiling_result
                     if stat_loggers:
                         assert outputs.scheduler_stats is not None
                         AsyncLLM._record_stats(

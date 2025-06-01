@@ -43,7 +43,7 @@ from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
                                         KVCacheConfig, KVCacheSpec,
                                         SlidingWindowSpec)
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, LogprobsTensors,
-                             ModelRunnerOutput)
+                             ModelRunnerOutput, MoEModelProfilingResult)
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
@@ -1201,6 +1201,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             finished_sending, finished_recving = (
                 self.get_finished_kv_transfers(scheduler_output))
 
+        moe_model_profiling_result: Optional[MoEModelProfilingResult] = None
+
         if self.use_aux_hidden_state_outputs:
             hidden_states, aux_hidden_states = model_output
         else:
@@ -1208,8 +1210,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if not reports_chosen_experts:
                 hidden_states = model_output
             else:
-                hidden_states, experts = model_output
-                experts = [expert.cpu().tolist() for expert in experts]
+                hidden_states, moe_model_profiling_result = model_output
+                assert moe_model_profiling_result is not None
+                experts = [r.topk_ids for r in moe_model_profiling_result]
                 # print(f"Experts: {experts}")
                 # Create a CSV file with the filename as the current timestamp
                 csv_filename = "experts_logs/granite_burst_experts.csv"
@@ -1444,6 +1447,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             prompt_logprobs_dict=prompt_logprobs_dict,
             finished_sending=finished_sending,
             finished_recving=finished_recving,
+            moe_model_profiling_result=moe_model_profiling_result,
         )
 
     def kv_connector_no_forward(

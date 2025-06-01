@@ -2,10 +2,11 @@
 
 import importlib
 import threading
+import time
 from abc import abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 from weakref import WeakValueDictionary
 
 import torch
@@ -29,6 +30,7 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.platforms.interface import CpuArchEnum
 from vllm.utils import direct_register_custom_op
+from vllm.v1.outputs import MoEBlockProfilingResult
 
 has_pplx = importlib.util.find_spec("pplx_kernels") is not None
 
@@ -762,6 +764,7 @@ class FusedMoE(torch.nn.Module):
         e_score_correction_bias: Optional[torch.Tensor] = None,
         apply_router_weight_on_input: bool = False,
         activation: str = "silu",
+        enable_blockwise_profiling: bool = False,
     ):
         super().__init__()
 
@@ -816,6 +819,7 @@ class FusedMoE(torch.nn.Module):
         self.e_score_correction_bias = e_score_correction_bias
         self.apply_router_weight_on_input = apply_router_weight_on_input
         self.activation = activation
+        self.enable_blockwise_profiling = enable_blockwise_profiling
 
         if self.scoring_func != "softmax" and not self.use_grouped_topk:
             raise ValueError("Only softmax scoring function is supported for "
@@ -1273,7 +1277,7 @@ class FusedMoE(torch.nn.Module):
             router_logits = full_router_logits[chunk_start:chunk_end, :]
 
             # Matrix multiply.
-            final_hidden_states = self.quant_method.apply(
+            final_hidden_states, _ = self.quant_method.apply(
                 layer=self,
                 x=hidden_states,
                 router_logits=router_logits,
@@ -1320,11 +1324,22 @@ class FusedMoE(torch.nn.Module):
         if self.moe_parallel_config.use_pplx_kernels:
             return self.forward_impl_chunked(hidden_states, router_logits)
 
+        events: dict[str, Any] = {
+            k: torch.cuda.Event(enable_timing=True)
+            for k in [
+                'moe_block_start', 'moe_dispatch_end', 'moe_mlp_end',
+                'moe_combine_end'
+            ]
+        }
+        moe_block_start = time.perf_counter()
+        events['moe_block_start'].record()
+
         if self.dp_size > 1:
             hidden_states, router_logits = get_ep_group().dispatch(
                 hidden_states, router_logits)
+        events['moe_dispatch_end'].record()
         # Matrix multiply.
-        final_hidden_states = self.quant_method.apply(
+        final_hidden_states, topk_ids = self.quant_method.apply(
             layer=self,
             x=hidden_states,
             router_logits=router_logits,
@@ -1341,6 +1356,7 @@ class FusedMoE(torch.nn.Module):
             activation=self.activation,
             apply_router_weight_on_input=self.apply_router_weight_on_input,
         )
+        events['moe_mlp_end'].record()
 
         if self.dp_size > 1:
             final_hidden_states = get_ep_group().combine(final_hidden_states)
@@ -1349,8 +1365,24 @@ class FusedMoE(torch.nn.Module):
             # Default set to False. (May have to add shared expert outputs.)
             final_hidden_states = tensor_model_parallel_all_reduce(
                 final_hidden_states)
+        events['moe_combine_end'].record()
 
-        return final_hidden_states
+        if self.enable_blockwise_profiling:
+            torch.cuda.synchronize()
+            timings: dict[str, float] = {
+                k:
+                (v.elapsed_time(events['moe_block_start']) + moe_block_start)
+                for k, v in events.items()
+            }
+            moe_block_profiling_result = MoEBlockProfilingResult(
+                time_dispatch_end=timings['moe_dispatch_end'],
+                time_mlp_end=timings['moe_mlp_end'],
+                time_combine_end=timings['moe_combine_end'],
+                topk_ids=topk_ids.detach().cpu().tolist(),
+            )
+            return final_hidden_states, moe_block_profiling_result
+        else:
+            return final_hidden_states
 
     @classmethod
     def make_expert_params_mapping(

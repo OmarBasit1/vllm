@@ -821,6 +821,8 @@ class Scheduler(SchedulerInterface):
         engine_core_outputs = EngineCoreOutputs(
             outputs=outputs,
             scheduler_stats=self.make_stats(spec_decoding_stats),
+            moe_model_profiling_result=model_runner_output.
+            moe_model_profiling_result,
         )
         if self.include_finished_set:
             #TODO currently sending duplicates here, improve this
