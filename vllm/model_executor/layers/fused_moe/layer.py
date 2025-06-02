@@ -1371,10 +1371,11 @@ class FusedMoE(torch.nn.Module):
             torch.cuda.synchronize()
             timings: dict[str, float] = {
                 k:
-                (v.elapsed_time(events['moe_block_start']) + moe_block_start)
+                (events['moe_block_start'].elapsed_time(v) + moe_block_start)
                 for k, v in events.items()
             }
             moe_block_profiling_result = MoEBlockProfilingResult(
+                time_block_start=timings['moe_block_start'],
                 time_dispatch_end=timings['moe_dispatch_end'],
                 time_mlp_end=timings['moe_mlp_end'],
                 time_combine_end=timings['moe_combine_end'],
