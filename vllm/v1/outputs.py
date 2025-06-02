@@ -61,7 +61,6 @@ class LogprobsTensors(NamedTuple):
 
 @dataclass
 class MoEBlockProfilingResult:
-    # All times are relative to the start of the MoE block
     time_block_start: float
     time_dispatch_end: float
     time_mlp_end: float
