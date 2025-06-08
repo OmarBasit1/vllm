@@ -61,11 +61,14 @@ class LogprobsTensors(NamedTuple):
 
 @dataclass
 class MoEBlockProfilingResult:
-    time_block_start: float
-    time_dispatch_end: float
-    time_mlp_end: float
-    time_combine_end: float
-    topk_ids: list[list[int]]  # [num_tokens_in_batch, k]
+    # https://excalidraw.com/#json=pmXc95pYUpEBUVaO6DDM5,NT4Apr1QHe7pkEgIwueM4Q
+    time_attn: Optional[float] = None
+    time_moe_block_start: Optional[float] = None
+    time_dispatch: Optional[float] = None
+    time_mlp: Optional[float] = None
+    time_combine: Optional[float] = None
+    time_moe_block_end: Optional[float] = None
+    topk_ids: Optional[list[list[int]]] = None  # [num_tokens_in_batch, k]
 
 
 MoEModelProfilingResult = list[MoEBlockProfilingResult]

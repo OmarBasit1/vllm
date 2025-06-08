@@ -23,6 +23,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
+import time
 from collections.abc import Iterable
 from typing import Any, Optional, Union
 
@@ -116,8 +117,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                                 reduce_results=False,
                                 renormalize=config.norm_topk_prob,
                                 quant_config=quant_config,
-                                prefix=f"{prefix}.experts",
-                                enable_blockwise_profiling=True)
+                                prefix=f"{prefix}.experts")
 
         self.gate = ReplicatedLinear(config.hidden_size,
                                      config.num_experts,
@@ -139,8 +139,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                                                   bias=False)
 
     def forward(
-        self, hidden_states: torch.Tensor
-    ) -> tuple[torch.Tensor, MoEBlockProfilingResult]:
+        self,
+        hidden_states: torch.Tensor,
+        moe_block_profiling_result: Optional[MoEBlockProfilingResult] = None,
+    ) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
         orig_shape = hidden_states.shape
         hidden_dim = hidden_states.shape[-1]
@@ -152,17 +154,26 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 shared_output = F.sigmoid(
                     self.shared_expert_gate(hidden_states)) * shared_output
 
+        if moe_block_profiling_result:
+            torch.cuda.synchronize()
+            moe_block_profiling_result.time_moe_block_start = time.perf_counter(
+            )
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        final_hidden_states, moe_block_profiling_result = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits)
+        final_hidden_states = self.experts(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            moe_block_profiling_result=moe_block_profiling_result)
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
         if self.tp_size > 1:
             final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(  # noqa E501
                 final_hidden_states)
+        if moe_block_profiling_result:
+            torch.cuda.synchronize()
+            moe_block_profiling_result.time_moe_block_end = time.perf_counter()
 
-        return final_hidden_states.view(orig_shape), moe_block_profiling_result
+        return final_hidden_states.view(orig_shape)
 
 
 class Qwen2MoeAttention(nn.Module):
@@ -262,6 +273,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        enable_moe_block_profiling: bool = True,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -272,6 +284,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
                                               None)
         max_position_embeddings = getattr(config, "max_position_embeddings",
                                           8192)
+        self.enable_moe_block_profiling = enable_moe_block_profiling
         self.self_attn = Qwen2MoeAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -313,7 +326,13 @@ class Qwen2MoeDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor, MoEBlockProfilingResult]:
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[MoEBlockProfilingResult]]:
+        moe_block_profiling_result: Optional[MoEBlockProfilingResult] = None
+        if self.enable_moe_block_profiling:
+            torch.cuda.synchronize()
+            moe_block_profiling_result = MoEBlockProfilingResult()
+            moe_block_profiling_result.time_attn = time.perf_counter()
+
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -329,8 +348,10 @@ class Qwen2MoeDecoderLayer(nn.Module):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        hidden_states, expert_profiling_result = self.mlp(hidden_states)
-        return hidden_states, residual, expert_profiling_result
+        hidden_states = self.mlp(
+            hidden_states,
+            moe_block_profiling_result=moe_block_profiling_result)
+        return hidden_states, residual, moe_block_profiling_result
 
 
 # @support_torch_compile

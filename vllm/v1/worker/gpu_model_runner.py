@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
-import csv
 import gc
-import os
 import time
 import weakref
 from typing import TYPE_CHECKING, Optional, Union
@@ -1211,19 +1209,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 hidden_states = model_output
             else:
                 hidden_states, moe_model_profiling_result = model_output
-                assert moe_model_profiling_result is not None
-                experts = [r.topk_ids for r in moe_model_profiling_result]
-                # print(f"Experts: {experts}")
-                # Create a CSV file with the filename as the current timestamp
-                csv_filename = "experts_logs/granite_burst_experts.csv"
-                os.makedirs(os.path.dirname(csv_filename), exist_ok=True)
-                if not os.path.exists(csv_filename):
-                    open(csv_filename, "w").close()
-                # Write the experts data to the CSV file and flush to disk
-                with open(csv_filename, mode="a", newline="") as csvfile:
-                    writer = csv.writer(csvfile)
-                    writer.writerow(self.input_batch.req_ids)
-                    writer.writerow(experts)
         # Broadcast PP output for external_launcher (torchrun)
         # to make sure we are synced across pp ranks
         # TODO: Support overlapping mirco-batches
