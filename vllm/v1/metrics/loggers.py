@@ -479,6 +479,7 @@ class CSVLogger(StatLoggerBase):
         self.csv_buf: list[dict] = []
         self.buf_lock = threading.Lock()
         self.executor = ThreadPoolExecutor(max_workers=1)
+        self.engine_index = engine_index
 
         atexit.register(self._flush_remaining_sync)
 
