@@ -508,11 +508,18 @@ class CSVLogger(StatLoggerBase):
 
     def record(self, scheduler_stats: SchedulerStats,
                iteration_stats: Optional[IterationStats]):
-        with self.buf_lock:
-            if iteration_stats and iteration_stats.moe_model_profiling_result:
-                self.csv_buf.append(
-                    moe_model_profiling_result_to_dict(
-                        iteration_stats.moe_model_profiling_result))
+        if iteration_stats and iteration_stats.moe_model_profiling_result:
+            moe_dict = moe_model_profiling_result_to_dict(
+                iteration_stats.moe_model_profiling_result)
+            moe_dict['num_running_reqs'] = \
+                scheduler_stats.num_running_reqs
+            moe_dict['num_waiting_reqs'] = scheduler_stats.num_waiting_reqs
+            moe_dict['num_computed_tokens'] = \
+                scheduler_stats.num_computed_tokens_list
+            moe_dict[
+                'num_prompt_tokens'] = scheduler_stats.num_prompt_tokens_list
+            with self.buf_lock:
+                self.csv_buf.append(moe_dict)
         self.increment_counter_and_maybe_persist_to_disk()
 
     def log_engine_initialized(self):

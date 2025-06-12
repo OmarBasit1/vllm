@@ -30,8 +30,13 @@ class PrefixCacheStats:
 class SchedulerStats:
     """Stats associated with the scheduler."""
 
+    # Number of request that will be scheduled in the next iteration
     num_running_reqs: int = 0
+    # NUmber of requests that are waiting to be scheduled in the next iteration
     num_waiting_reqs: int = 0
+    # Number of tokens that have upto now been computed for each request
+    num_computed_tokens_list: list[int] = field(default_factory=list)
+    num_prompt_tokens_list: list[int] = field(default_factory=list)
 
     gpu_cache_usage: float = 0.0
 

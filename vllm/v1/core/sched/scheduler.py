@@ -148,6 +148,10 @@ class Scheduler(SchedulerInterface):
             enable_kv_cache_events=self.enable_kv_cache_events,
         )
 
+        # Added for logging
+        self.num_computed_tokens: list[int] = []
+        self.num_prompt_tokens: list[int] = []
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -695,6 +699,8 @@ class Scheduler(SchedulerInterface):
         outputs: list[EngineCoreOutput] = []
         spec_decoding_stats: Optional[SpecDecodingStats] = None
 
+        self.num_computed_tokens = []
+        self.num_prompt_tokens = []
         # NOTE(woosuk): As len(self.running) can be up to 1K or more, the below
         # loop can be a performance bottleneck. We should do our best to avoid
         # expensive operations inside the loop.
@@ -807,6 +813,9 @@ class Scheduler(SchedulerInterface):
             if not stopped:
                 new_running.append(request)
 
+            self.num_computed_tokens.append(request.num_computed_tokens)
+            self.num_prompt_tokens.append(request.num_prompt_tokens)
+
         # P/D: update state for finished KV Transfers.
         self._update_from_kv_xfer_finished(model_runner_output)
 
@@ -907,6 +916,8 @@ class Scheduler(SchedulerInterface):
         return SchedulerStats(
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
+            num_computed_tokens_list=self.num_computed_tokens,
+            num_prompt_tokens_list=self.num_prompt_tokens,
             gpu_cache_usage=self.kv_cache_manager.usage,
             prefix_cache_stats=prefix_cache_stats,
             spec_decoding_stats=spec_decoding_stats,
