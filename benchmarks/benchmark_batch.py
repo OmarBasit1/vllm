@@ -6,7 +6,6 @@ import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import list
 
 import uvloop
 
@@ -53,6 +52,16 @@ class BenchmarkBatchParam:
         hash_str += str(self.delay_time_min_s)
         hash_str += str(self.delay_time_max_s)
         return int(hashlib.md5(hash_str.encode()).hexdigest(), 16)
+
+    def get_batch_type(self) -> str:
+        if len(self.prefill_input_lens) > 0 and len(self.decode_input_lens):
+            return "hybrid"
+        elif len(self.prefill_input_lens) > 0:
+            return "prefill-only"
+        elif len(self.decode_input_lens) > 0:
+            return "decode-only"
+        else:
+            raise RuntimeError("Malformed BenchmarkBatchParam")
 
     def get_total_requests(self) -> int:
         return len(self.prefill_input_lens) + len(self.decode_input_lens)
@@ -182,7 +191,7 @@ async def execute_benchmark_scenario(
     print("-" * 50)
 
 
-async def main(
+async def benchmark_batch(
     engine_args: AsyncEngineArgs, benchmark_params: Iterable[BenchmarkBatchParam]
 ):
     """
@@ -250,4 +259,4 @@ if __name__ == "__main__":
     ]
 
     # Now, pass the correct 'engine_args' object to the function
-    uvloop.run(main(engine_args, benchmark_params_list))
+    uvloop.run(benchmark_batch(engine_args, benchmark_params_list))
