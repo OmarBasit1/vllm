@@ -1358,8 +1358,8 @@ class FusedMoE(torch.nn.Module):
             apply_router_weight_on_input=self.apply_router_weight_on_input,
         )
         if moe_block_profiling_result:
-            moe_block_profiling_result.topk_ids = \
-                    topk_ids.detach().cpu().tolist()
+            # moe_block_profiling_result.topk_ids = \
+            #         topk_ids.detach().cpu().tolist()
             torch.cuda.synchronize()
             moe_block_profiling_result.time_combine = time.perf_counter()
 
