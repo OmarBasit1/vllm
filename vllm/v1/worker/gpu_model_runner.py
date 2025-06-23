@@ -103,7 +103,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.speculative_config = vllm_config.speculative_config
         self.prompt_adapter_config = vllm_config.prompt_adapter_config
         self.observability_config = vllm_config.observability_config
-        self.collect_experts = vllm_config.collect_experts
 
         from vllm.model_executor.models.utils import set_cpu_offload_max_bytes
         set_cpu_offload_max_bytes(
@@ -1284,7 +1283,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.compilation_config.pass_config. \
                 enable_sequence_parallelism and tp_size > 1:
                 from vllm.utils import round_up
-
                 num_input_tokens = round_up(num_scheduled_tokens, tp_size)
             else:
                 num_input_tokens = num_scheduled_tokens
@@ -1363,6 +1361,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if self.use_aux_hidden_state_outputs:
             hidden_states, aux_hidden_states = model_output
+        else:
+            hidden_states = model_output
         # Broadcast PP output for external_launcher (torchrun)
         # to make sure we are synced across pp ranks
         # TODO: Support overlapping mirco-batches
@@ -1978,11 +1978,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs
             else:
-                reports_chosen_experts = isinstance(outputs, tuple)
-                if reports_chosen_experts:
-                    hidden_states, _ = outputs
-                else:
-                    hidden_states = outputs
+                hidden_states = outputs
 
             if self.speculative_config and self.speculative_config.use_eagle():
                 assert isinstance(self.drafter, EagleProposer)

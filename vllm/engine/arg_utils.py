@@ -1266,7 +1266,6 @@ class EngineArgs:
             kv_events_config=self.kv_events_config,
             additional_config=self.additional_config,
             log_dir=self.log_dir,
-            collect_experts=self.collect_experts,
         )
 
         return config
