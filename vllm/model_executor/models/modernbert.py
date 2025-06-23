@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable
 from typing import Optional
 
@@ -12,7 +13,7 @@ from vllm.config import VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.linear import (QKVParallelLinear,
                                                RowParallelLinear)
-from vllm.model_executor.layers.pooler import CrossEncodingPooler
+from vllm.model_executor.layers.pooler import ClassifierPooler
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding)
@@ -20,7 +21,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.pooling_metadata import PoolingMetadata
 from vllm.sequence import IntermediateTensors, PoolerOutput
 
-from .interfaces import SupportsCrossEncoding
+from .interfaces import SupportsCrossEncoding, SupportsV0Only
 from .utils import WeightsMapper, maybe_prefix
 
 
@@ -269,7 +270,8 @@ class ModernBertPooler(nn.Module):
         return pooled_output
 
 
-class ModernBertForSequenceClassification(nn.Module, SupportsCrossEncoding):
+class ModernBertForSequenceClassification(nn.Module, SupportsV0Only,
+                                          SupportsCrossEncoding):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -278,8 +280,9 @@ class ModernBertForSequenceClassification(nn.Module, SupportsCrossEncoding):
         self.model = ModernBertModel(vllm_config=vllm_config,
                                      prefix=maybe_prefix(prefix, "modernbert"))
         self.classifier = nn.Linear(config.hidden_size, config.num_labels)
-        self._pooler = CrossEncodingPooler(config, self.classifier,
-                                           ModernBertPooler(config))
+        self._pooler = ClassifierPooler(vllm_config.model_config,
+                                        self.classifier,
+                                        ModernBertPooler(config))
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
 
