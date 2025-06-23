@@ -12,8 +12,7 @@ from vllm.multimodal import MultiModalKwargs
 from vllm.multimodal.inputs import PlaceholderRange
 from vllm.sampling_params import SamplingParams
 from vllm.v1.metrics.stats import SchedulerStats
-from vllm.v1.outputs import (LogprobsLists, LogprobsTensors,
-                             MoEModelProfilingResult)
+from vllm.v1.outputs import LogprobsLists, LogprobsTensors
 
 # These are possible values of RequestOutput.finish_reason,
 # so form part of the external API.
@@ -150,8 +149,6 @@ class EngineCoreOutputs(
     # In DP case, used to signal that a request was received for an
     # "old" wave, so the next wave needs to be started in other engines.
     start_wave: Optional[int] = None
-
-    moe_model_profiling_result: Optional[MoEModelProfilingResult] = None
 
     def __post_init__(self):
         if self.timestamp == 0.0:

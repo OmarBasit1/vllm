@@ -41,7 +41,7 @@ from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
                                         KVCacheConfig, KVCacheSpec,
                                         SlidingWindowSpec)
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, LogprobsTensors,
-                             ModelRunnerOutput, MoEModelProfilingResult)
+                             ModelRunnerOutput)
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
@@ -1199,16 +1199,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             finished_sending, finished_recving = (
                 self.get_finished_kv_transfers(scheduler_output))
 
-        moe_model_profiling_result: Optional[MoEModelProfilingResult] = None
-
         if self.use_aux_hidden_state_outputs:
             hidden_states, aux_hidden_states = model_output
-        else:
-            reports_chosen_experts = isinstance(model_output, tuple)
-            if not reports_chosen_experts:
-                hidden_states = model_output
-            else:
-                hidden_states, moe_model_profiling_result = model_output
         # Broadcast PP output for external_launcher (torchrun)
         # to make sure we are synced across pp ranks
         # TODO: Support overlapping mirco-batches
@@ -1432,7 +1424,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             prompt_logprobs_dict=prompt_logprobs_dict,
             finished_sending=finished_sending,
             finished_recving=finished_recving,
-            moe_model_profiling_result=moe_model_profiling_result,
         )
 
     def kv_connector_no_forward(

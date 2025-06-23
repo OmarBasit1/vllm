@@ -18,7 +18,6 @@ from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_utils import PrefixCachingMetrics
 from vllm.v1.engine import FinishReason
 from vllm.v1.metrics.stats import IterationStats, SchedulerStats
-from vllm.v1.outputs import moe_model_profiling_result_to_dict
 from vllm.v1.spec_decode.metrics import SpecDecodingLogging, SpecDecodingProm
 
 logger = init_logger(__name__)
@@ -508,18 +507,16 @@ class CSVLogger(StatLoggerBase):
 
     def record(self, scheduler_stats: SchedulerStats,
                iteration_stats: Optional[IterationStats]):
-        if iteration_stats and iteration_stats.moe_model_profiling_result:
-            moe_dict = moe_model_profiling_result_to_dict(
-                iteration_stats.moe_model_profiling_result)
-            moe_dict['num_running_reqs'] = \
-                scheduler_stats.num_running_reqs
-            moe_dict['num_waiting_reqs'] = scheduler_stats.num_waiting_reqs
-            moe_dict['num_computed_tokens'] = \
-                scheduler_stats.num_computed_tokens_list
-            moe_dict[
-                'num_prompt_tokens'] = scheduler_stats.num_prompt_tokens_list
-            with self.buf_lock:
-                self.csv_buf.append(moe_dict)
+        stats = {
+            'engine_index': self.engine_index,
+            'num_running_reqs': scheduler_stats.num_running_reqs,
+            'num_waiting_reqs': scheduler_stats.num_waiting_reqs,
+            'num_computed_tokens': scheduler_stats.num_computed_tokens_list,
+            'num_prompt_tokens': scheduler_stats.num_prompt_tokens_list,
+        }
+
+        with self.buf_lock:
+            self.csv_buf.append(stats)
         self.increment_counter_and_maybe_persist_to_disk()
 
     def log_engine_initialized(self):

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 # Adapted from
 # https://github.com/huggingface/transformers/blob/v4.28.0/src/transformers/models/qwen2_moe/modeling_qwen2_moe.py
@@ -23,7 +24,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
-import time
 from collections.abc import Iterable
 from typing import Any, Optional, Union
 
@@ -33,6 +33,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from vllm.attention import Attention
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
@@ -51,7 +52,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
-from vllm.v1.outputs import MoEBlockProfilingResult, MoEModelProfilingResult
 
 from .interfaces import SupportsPP
 from .utils import (AutoWeightsLoader, extract_layer_index,
@@ -138,11 +138,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                                                   1,
                                                   bias=False)
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        moe_block_profiling_result: Optional[MoEBlockProfilingResult] = None,
-    ) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
         orig_shape = hidden_states.shape
         hidden_dim = hidden_states.shape[-1]
@@ -154,24 +150,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 shared_output = F.sigmoid(
                     self.shared_expert_gate(hidden_states)) * shared_output
 
-        if moe_block_profiling_result:
-            torch.cuda.synchronize()
-            moe_block_profiling_result.time_moe_block_start = time.perf_counter(
-            )
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-            moe_block_profiling_result=moe_block_profiling_result)
+        final_hidden_states = self.experts(hidden_states=hidden_states,
+                                           router_logits=router_logits)
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
         if self.tp_size > 1:
             final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(  # noqa E501
                 final_hidden_states)
-        if moe_block_profiling_result:
-            torch.cuda.synchronize()
-            moe_block_profiling_result.time_moe_block_end = time.perf_counter()
 
         return final_hidden_states.view(orig_shape)
 
@@ -273,7 +260,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        enable_moe_block_profiling: bool = True,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -284,7 +270,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
                                               None)
         max_position_embeddings = getattr(config, "max_position_embeddings",
                                           8192)
-        self.enable_moe_block_profiling = enable_moe_block_profiling
         self.self_attn = Qwen2MoeAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -326,13 +311,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor, Optional[MoEBlockProfilingResult]]:
-        moe_block_profiling_result: Optional[MoEBlockProfilingResult] = None
-        if self.enable_moe_block_profiling:
-            torch.cuda.synchronize()
-            moe_block_profiling_result = MoEBlockProfilingResult()
-            moe_block_profiling_result.time_attn = time.perf_counter()
-
+    ) -> torch.Tensor:
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -348,13 +327,11 @@ class Qwen2MoeDecoderLayer(nn.Module):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        hidden_states = self.mlp(
-            hidden_states,
-            moe_block_profiling_result=moe_block_profiling_result)
-        return hidden_states, residual, moe_block_profiling_result
+        hidden_states = self.mlp(hidden_states)
+        return hidden_states, residual
 
 
-# @support_torch_compile
+@support_torch_compile
 class Qwen2MoeModel(nn.Module):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -393,8 +370,7 @@ class Qwen2MoeModel(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
-    ) -> Union[tuple[torch.Tensor, MoEModelProfilingResult],
-               IntermediateTensors]:
+    ) -> Union[torch.Tensor, IntermediateTensors]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -405,19 +381,15 @@ class Qwen2MoeModel(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
-        model_profiling_result: MoEModelProfilingResult = []
         for layer in self.layers[self.start_layer:self.end_layer]:
-            hidden_states, residual, block_profiling_result = layer(
-                positions, hidden_states, residual)
-            model_profiling_result.append(block_profiling_result)
+            hidden_states, residual = layer(positions, hidden_states, residual)
         if not get_pp_group().is_last_rank:
-            # TODO: support expert profiling with PP
             return IntermediateTensors({
                 "hidden_states": hidden_states,
                 "residual": residual
             })
         hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states, model_profiling_result
+        return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:

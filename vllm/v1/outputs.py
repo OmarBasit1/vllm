@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from dataclasses import asdict, dataclass
-from typing import Any, NamedTuple, Optional
+from dataclasses import dataclass
+from typing import NamedTuple, Optional
 
 import torch
 
@@ -60,32 +60,6 @@ class LogprobsTensors(NamedTuple):
 
 
 @dataclass
-class MoEBlockProfilingResult:
-    # https://excalidraw.com/#json=pmXc95pYUpEBUVaO6DDM5,NT4Apr1QHe7pkEgIwueM4Q
-    time_attn: Optional[float] = None
-    time_moe_block_start: Optional[float] = None
-    time_dispatch: Optional[float] = None
-    time_mlp: Optional[float] = None
-    time_combine: Optional[float] = None
-    time_moe_block_end: Optional[float] = None
-    topk_ids: Optional[list[list[int]]] = None  # [num_tokens_in_batch, k]
-
-
-MoEModelProfilingResult = list[MoEBlockProfilingResult]
-
-
-def moe_model_profiling_result_to_dict(
-        model_result: MoEModelProfilingResult) -> dict:
-    """
-    Append each key with block layer id.
-    """
-    ret: dict[str, Any] = {}
-    for i, block_result in enumerate(model_result):
-        ret |= {f'{k}_{i}': v for k, v in asdict(block_result).items()}
-    return ret
-
-
-@dataclass
 class SamplerOutput:
 
     # [num_reqs, max_num_generated_tokens]
@@ -129,8 +103,6 @@ class ModelRunnerOutput:
     # [req_ids]
     finished_sending: Optional[set[str]] = None
     finished_recving: Optional[set[str]] = None
-
-    moe_model_profiling_result: Optional[MoEModelProfilingResult] = None
 
 
 EMPTY_MODEL_RUNNER_OUTPUT = ModelRunnerOutput(req_ids=[],

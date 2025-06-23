@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 # Adapted from
 # https://github.com/huggingface/transformers/blob/v4.28.0/src/transformers/models/llama/modeling_llama.py
@@ -22,7 +23,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only Mixtral model."""
-import time
 from collections.abc import Iterable
 from typing import Optional, Union
 
@@ -31,6 +31,7 @@ from torch import nn
 from transformers import MixtralConfig
 
 from vllm.attention import Attention
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.fused_moe import FusedMoE
@@ -47,7 +48,6 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader, maybe_remap_kv_scale_name)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
-from vllm.v1.outputs import MoEBlockProfilingResult, MoEModelProfilingResult
 
 from .interfaces import SupportsLoRA, SupportsPP
 from .utils import (AutoWeightsLoader, is_pp_missing_parameter,
@@ -86,41 +86,25 @@ class MixtralMoE(nn.Module):
                                      quant_config=None,
                                      prefix=f"{prefix}.gate")
 
-        self.experts = FusedMoE(
-            num_experts=num_experts,
-            top_k=top_k,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            params_dtype=params_dtype,
-            reduce_results=True,
-            renormalize=True,
-            quant_config=quant_config,
-            tp_size=tp_size,
-            dp_size=dp_size,
-            prefix=f"{prefix}.experts",
-        )
+        self.experts = FusedMoE(num_experts=num_experts,
+                                top_k=top_k,
+                                hidden_size=hidden_size,
+                                intermediate_size=intermediate_size,
+                                params_dtype=params_dtype,
+                                reduce_results=True,
+                                renormalize=True,
+                                quant_config=quant_config,
+                                tp_size=tp_size,
+                                dp_size=dp_size,
+                                prefix=f"{prefix}.experts")
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        moe_block_profiling_result: Optional[MoEBlockProfilingResult] = None,
-    ) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_size)
         # router_logits: (num_tokens, n_experts)
-        if moe_block_profiling_result:
-            torch.cuda.synchronize()
-            moe_block_profiling_result.time_moe_block_start = time.perf_counter(
-            )
         router_logits, _ = self.gate(hidden_states)
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-            moe_block_profiling_result=moe_block_profiling_result)
-        if moe_block_profiling_result:
-            torch.cuda.synchronize()
-            moe_block_profiling_result.time_moe_block_end = time.perf_counter()
+        final_hidden_states = self.experts(hidden_states, router_logits)
         return final_hidden_states.view(orig_shape)
 
 
@@ -215,7 +199,6 @@ class MixtralDecoderLayer(nn.Module):
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        enable_moe_block_profiling: bool = True,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -242,20 +225,13 @@ class MixtralDecoderLayer(nn.Module):
                                        eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
                                                 eps=config.rms_norm_eps)
-        self.enable_moe_block_profiling = enable_moe_block_profiling
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor, Optional[MoEBlockProfilingResult]]:
-        moe_block_profiling_result: Optional[MoEBlockProfilingResult] = None
-        if self.enable_moe_block_profiling:
-            torch.cuda.synchronize()
-            moe_block_profiling_result = MoEBlockProfilingResult()
-            moe_block_profiling_result.time_attn = time.perf_counter()
-
+    ) -> torch.Tensor:
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -271,13 +247,11 @@ class MixtralDecoderLayer(nn.Module):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        hidden_states = self.block_sparse_moe(
-            hidden_states,
-            moe_block_profiling_result=moe_block_profiling_result)
-        return hidden_states, residual, moe_block_profiling_result
+        hidden_states = self.block_sparse_moe(hidden_states)
+        return hidden_states, residual
 
 
-# @support_torch_compile
+@support_torch_compile
 class MixtralModel(nn.Module):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -322,8 +296,7 @@ class MixtralModel(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: Optional[IntermediateTensors],
         inputs_embeds: Optional[torch.Tensor] = None,
-    ) -> Union[tuple[torch.Tensor, MoEModelProfilingResult],
-               IntermediateTensors]:
+    ) -> Union[torch.Tensor, IntermediateTensors]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -334,19 +307,15 @@ class MixtralModel(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
-        model_profiling_result: MoEModelProfilingResult = []
         for layer in self.layers[self.start_layer:self.end_layer]:
-            hidden_states, residual, block_profiling_result = layer(
-                positions, hidden_states, residual)
-            model_profiling_result.append(block_profiling_result)
+            hidden_states, residual = layer(positions, hidden_states, residual)
         if not get_pp_group().is_last_rank:
-            # TODO: support expert profiling with PP
             return IntermediateTensors({
                 "hidden_states": hidden_states,
                 "residual": residual
             })
         hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states, model_profiling_result
+        return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:

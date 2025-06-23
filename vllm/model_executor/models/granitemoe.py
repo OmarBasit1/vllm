@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 # Adapted from
 # https://github.com/huggingface/transformers/blob/v4.28.0/src/transformers/models/llama/modeling_llama.py
@@ -30,6 +31,7 @@ from torch import nn
 from transformers.models.granitemoe import GraniteMoeConfig
 
 from vllm.attention import Attention
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.fused_moe import FusedMoE
@@ -45,7 +47,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     DEFAULT_VOCAB_PADDING_SIZE, ParallelLMHead, VocabParallelEmbedding)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
-from vllm.v1.outputs import MoEBlockProfilingResult, MoEModelProfilingResult
 
 from . import mixtral
 from .interfaces import SupportsLoRA, SupportsPP
@@ -89,20 +90,16 @@ class GraniteMoeMoE(nn.Module):
                                 renormalize=True,
                                 quant_config=quant_config,
                                 tp_size=tp_size,
-                                prefix=f"{prefix}.experts",
-                                enable_blockwise_profiling=True)
+                                prefix=f"{prefix}.experts")
 
-    def forward(
-        self, hidden_states: torch.Tensor
-    ) -> tuple[torch.Tensor, MoEBlockProfilingResult]:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_size)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        final_hidden_states, moe_block_profiling_result = self.experts(
-            hidden_states, router_logits)
-        return final_hidden_states.view(orig_shape), moe_block_profiling_result
+        final_hidden_states = self.experts(hidden_states, router_logits)
+        return final_hidden_states.view(orig_shape)
 
 
 class GraniteMoeAttention(nn.Module):
@@ -228,7 +225,7 @@ class GraniteMoeDecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-    ) -> tuple[torch.Tensor, MoEBlockProfilingResult]:
+    ) -> torch.Tensor:
         # Self Attention
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -239,14 +236,13 @@ class GraniteMoeDecoderLayer(nn.Module):
         hidden_states = residual + hidden_states * self.residual_multiplier
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states, expert_profiling_result = self.block_sparse_moe(
-            hidden_states)
+        hidden_states = self.block_sparse_moe(hidden_states)
         hidden_states = residual + hidden_states * self.residual_multiplier
 
-        return hidden_states, expert_profiling_result
+        return hidden_states
 
 
-# @support_torch_compile
+@support_torch_compile
 class GraniteMoeModel(nn.Module):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -289,7 +285,7 @@ class GraniteMoeModel(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: Optional[IntermediateTensors],
         inputs_embeds: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, MoEModelProfilingResult] | IntermediateTensors:
+    ) -> torch.Tensor:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -301,19 +297,15 @@ class GraniteMoeModel(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
-        model_profiling_result: MoEModelProfilingResult = []
         for layer in self.layers[self.start_layer:self.end_layer]:
-            hidden_states, block_profiling_result = layer(
-                positions, hidden_states)
-            model_profiling_result.append(block_profiling_result)
+            hidden_states = layer(positions, hidden_states)
         if not get_pp_group().is_last_rank:
-            # TODO: support expert profiling with PP
             return IntermediateTensors({
                 "hidden_states": hidden_states,
                 "residual": residual
             })
         hidden_states = self.norm(hidden_states)
-        return hidden_states, model_profiling_result
+        return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
