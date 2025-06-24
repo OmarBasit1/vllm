@@ -551,18 +551,20 @@ class CSVLogger(StatLoggerBase):
                                   index=False)
         logger.info("CSVLogger persisted %d entries to disk", len(data))
 
-    def record(self, scheduler_stats: SchedulerStats,
+    def record(self, scheduler_stats: Optional[SchedulerStats],
                iteration_stats: Optional[IterationStats]):
-        stats = {
-            'engine_index': self.engine_index,
-            'num_running_reqs': scheduler_stats.num_running_reqs,
-            'num_waiting_reqs': scheduler_stats.num_waiting_reqs,
-            'num_computed_tokens': scheduler_stats.num_computed_tokens_list,
-            'num_prompt_tokens': scheduler_stats.num_prompt_tokens_list,
-        }
+        if scheduler_stats is not None:
+            stats = {
+                'engine_index': self.engine_index,
+                'num_running_reqs': scheduler_stats.num_running_reqs,
+                'num_waiting_reqs': scheduler_stats.num_waiting_reqs,
+                'num_computed_tokens':
+                scheduler_stats.num_computed_tokens_list,
+                'num_prompt_tokens': scheduler_stats.num_prompt_tokens_list,
+            }
 
-        with self.buf_lock:
-            self.csv_buf.append(stats)
+            with self.buf_lock:
+                self.csv_buf.append(stats)
         self.increment_counter_and_maybe_persist_to_disk()
 
     def log_engine_initialized(self):

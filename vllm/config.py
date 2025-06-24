@@ -3585,6 +3585,9 @@ class ObservabilityConfig:
     Note that collecting detailed timing information for each request can be
     expensive."""
 
+    collect_power_usage: bool = False
+    """Whether to collect power usage metrics for the request."""
+
     @cached_property
     def collect_model_forward_time(self) -> bool:
         """Whether to collect model forward time for the request."""
@@ -4249,7 +4252,8 @@ class VllmConfig:
     """The ID of the vLLM instance."""
     log_dir: str = "./logs"
     """The directory to store the logs."""
-
+    log_power: bool = False
+    """Whether to log power usage metrics."""
 
     def compute_hash(self) -> str:
         """

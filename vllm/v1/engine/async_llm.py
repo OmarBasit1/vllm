@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import multiprocessing
 from collections.abc import AsyncGenerator, Mapping
 from copy import copy
 from typing import Any, Optional, Union
@@ -18,6 +19,7 @@ from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.outputs import PoolingRequestOutput, RequestOutput
+from vllm.platforms.nvml_power_monitor import start_nvml_power_monitor
 from vllm.pooling_params import PoolingParams
 from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.sampling_params import SamplingParams
@@ -101,6 +103,19 @@ class AsyncLLM(EngineClient):
             engine_num=vllm_config.parallel_config.data_parallel_size,
             custom_stat_loggers=stat_loggers,
         )
+        # power logging only on rank 0
+        if vllm_config.log_power and \
+            vllm_config.parallel_config.data_parallel_rank == 0:
+            self.power_monitor_process = multiprocessing.Process(
+                target=start_nvml_power_monitor,
+                kwargs={
+                    'interval': 0.01,
+                    'csv_filename':
+                    f"{vllm_config.log_dir}/power_log_engine_0.csv",
+                    'power_queue': None,
+                },
+                daemon=True)
+            self.power_monitor_process.start()
 
         # Tokenizer (+ ensure liveness if running in another process).
         self.tokenizer = init_tokenizer_from_configs(
@@ -201,6 +216,9 @@ class AsyncLLM(EngineClient):
 
     def shutdown(self):
         """Shutdown, cleaning up the background proc and IPC."""
+        if self.power_monitor_process:
+            self.power_monitor_process.kill()
+            self.power_monitor_process.join()
 
         shutdown_prometheus()
 
