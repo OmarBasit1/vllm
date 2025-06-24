@@ -1015,6 +1015,7 @@ class Scheduler(SchedulerInterface):
         prefix_cache_stats = self.kv_cache_manager.make_prefix_cache_stats()
         assert prefix_cache_stats is not None
         return SchedulerStats(
+            now=time.perf_counter(),
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
             num_computed_tokens_list=self.num_computed_tokens,

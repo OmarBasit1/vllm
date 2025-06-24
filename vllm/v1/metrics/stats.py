@@ -29,7 +29,8 @@ class PrefixCacheStats:
 @dataclass
 class SchedulerStats:
     """Stats associated with the scheduler."""
-
+    # Time at which log collected
+    now: float = field(default_factory=time.time)
     # Number of request that will be scheduled in the next iteration
     num_running_reqs: int = 0
     # NUmber of requests that are waiting to be scheduled in the next iteration
@@ -46,6 +47,17 @@ class SchedulerStats:
     spec_decoding_stats: Optional[SpecDecodingStats] = None
 
     num_corrupted_reqs: int = 0
+
+    def to_dict(self) -> dict:
+        return {
+            "now": self.now,
+            "num_running_reqs": self.num_running_reqs,
+            "num_waiting_reqs": self.num_waiting_reqs,
+            "num_computed_tokens_list": self.num_computed_tokens_list,
+            "num_prompt_tokens_list": self.num_prompt_tokens_list,
+            "kv_cache_usage": self.kv_cache_usage,
+            "num_corrupted_reqs": self.num_corrupted_reqs,
+        }
 
 
 @dataclass
@@ -184,6 +196,15 @@ class IterationStats:
                                  inference_time=inference_time,
                                  decode_time=decode_time)
         self.finished_requests.append(finished_req)
+
+    def to_dict(self) -> dict:
+        return {
+            "num_generation_tokens": self.num_generation_tokens,
+            "num_prompt_tokens": self.num_prompt_tokens,
+            "num_preempted_reqs": self.num_preempted_reqs,
+            "time_to_first_tokens_iter": self.time_to_first_tokens_iter,
+            "time_per_output_tokens_iter": self.time_per_output_tokens_iter,
+        }
 
 
 class LoRARequestStates:

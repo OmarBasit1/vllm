@@ -7,7 +7,6 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-import list
 import pynvml
 
 from vllm.logger import init_logger
