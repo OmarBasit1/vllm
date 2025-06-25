@@ -112,6 +112,7 @@ class IterationStats:
         self.time_per_output_tokens_iter: list[float] = []
         self.waiting_lora_adapters: dict[str, int] = {}
         self.running_lora_adapters: dict[str, int] = {}
+        self.decoding_req_ids: set[str] = set()
 
     def _time_since(self, start: float) -> float:
         """Calculate an interval relative to this iteration's timestamp."""
@@ -143,6 +144,7 @@ class IterationStats:
         else:
             tpot = engine_core_timestamp - req_stats.last_token_ts
             self.time_per_output_tokens_iter.append(tpot)
+            self.decoding_req_ids.add(output.request_id)
 
         req_stats.last_token_ts = engine_core_timestamp
 
@@ -201,9 +203,11 @@ class IterationStats:
         return {
             "num_generation_tokens": self.num_generation_tokens,
             "num_prompt_tokens": self.num_prompt_tokens,
+            "num_completed_requests": len(self.finished_requests),
             "num_preempted_reqs": self.num_preempted_reqs,
             "time_to_first_tokens_iter": self.time_to_first_tokens_iter,
             "time_per_output_tokens_iter": self.time_per_output_tokens_iter,
+            "decoding_req_ids": list(self.decoding_req_ids),
         }
 
 
