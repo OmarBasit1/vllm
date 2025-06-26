@@ -61,6 +61,7 @@ from benchmark_dataset import (
     ASRDataset,
     BurstGPTDataset,
     ConversationDataset,
+    CSVTraceDataset,
     CustomDataset,
     HuggingFaceDataset,
     InstructCoderDataset,
@@ -150,6 +151,15 @@ async def get_request(
         interval = np.random.gamma(shape=burstiness, scale=theta)
         # The next request will be sent after the interval.
         await asyncio.sleep(interval)
+
+
+async def get_request_from_trace(input_requests, arrived_at: list[float]):
+    t_start = time.perf_counter()
+    for request, t in zip(input_requests, arrived_at):
+        interval = t - (time.perf_counter() - t_start)
+        if interval > 0:
+            await asyncio.sleep(interval)
+        yield request
 
 
 def calculate_metrics(
@@ -290,7 +300,11 @@ async def benchmark(
     max_concurrency: Optional[int],
     lora_modules: Optional[Iterable[str]],
     extra_body: Optional[dict],
+    arrived_at: Optional[list[float]],
 ):
+    """
+    If `arrived_at_arr` specified, will override `request_rate` and `burstiness`.
+    """
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
     else:
@@ -351,7 +365,13 @@ async def benchmark(
         if profile_output.success:
             print("Profiler started")
 
-    distribution = "Poisson process" if burstiness == 1.0 else "Gamma distribution"
+    if arrived_at is not None:
+        assert len(arrived_at) == len(input_requests)
+        distribution = "Trace"
+    elif burstiness == 1.0:
+        distribution = "Poisson process"
+    else:
+        distribution = "Gamma distribution"
 
     print(f"Traffic request rate: {request_rate}")
     print(f"Burstiness factor: {burstiness} ({distribution})")
@@ -373,7 +393,14 @@ async def benchmark(
 
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task] = []
-    async for request in get_request(input_requests, request_rate, burstiness):
+
+    request_gen = (
+        get_request_from_trace(input_requests, arrived_at)
+        if arrived_at is not None
+        else get_request(input_requests, request_rate, burstiness)
+    )
+
+    async for request in request_gen:
         prompt, prompt_len, output_len, mm_content = (
             request.prompt,
             request.prompt_len,
@@ -629,6 +656,8 @@ def main(args: argparse.Namespace):
             "'--dataset-path' if required."
         )
 
+    arrived_at: Optional[list[float]] = None
+
     if args.dataset_name == "custom":
         dataset = CustomDataset(dataset_path=args.dataset_path)
         input_requests = dataset.sample(
@@ -723,6 +752,16 @@ def main(args: argparse.Namespace):
             output_len=args.hf_output_len,
         )
 
+    elif args.dataset_name == "trace":
+        dataset = CSVTraceDataset(dataset_path=args.dataset_path)
+        input_requests = dataset.sample(
+            num_requests=args.num_prompts,
+            tokenizer=tokenizer,
+            output_len=args.custom_output_len,
+            skip_chat_template=args.custom_skip_chat_template,
+        )
+        arrived_at = dataset.get_arrived_at(args.num_prompts)
+
     else:
         # For datasets that follow a similar structure, use a mapping.
         dataset_mapping = {
@@ -802,6 +841,7 @@ def main(args: argparse.Namespace):
             max_concurrency=args.max_concurrency,
             lora_modules=args.lora_modules,
             extra_body=sampling_params,
+            arrived_at=arrived_at,
         )
     )
 
@@ -904,7 +944,7 @@ def create_argument_parser():
         "--dataset-name",
         type=str,
         default="sharegpt",
-        choices=["sharegpt", "burstgpt", "sonnet", "random", "hf", "custom"],
+        choices=["sharegpt", "burstgpt", "sonnet", "random", "hf", "custom", "trace"],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument(

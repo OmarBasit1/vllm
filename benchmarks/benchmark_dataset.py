@@ -1165,3 +1165,59 @@ class ASRDataset(HuggingFaceDataset):
             )
         self.maybe_oversample_requests(sampled_requests, num_requests)
         return sampled_requests
+
+
+class CSVTraceDataset(BenchmarkDataset):
+    """
+    Replays a CSV trace sequentially.
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.load_data()
+
+    def load_data(self) -> None:
+        if self.dataset_path is None:
+            raise ValueError("dataset_path must be provided for loading data.")
+        self.data = pd.read_csv(self.dataset_path)
+
+    def sample(
+        self,
+        tokenizer: PreTrainedTokenizerBase,
+        num_requests: int,
+        max_loras: Optional[int] = None,
+        lora_path: Optional[str] = None,
+        **kwargs,
+    ) -> list[SampleRequest]:
+        samples = []
+        num_prefill_tokens = (
+            self.data["num_prefill_tokens"].iloc[:num_requests].tolist()
+        )
+        num_decode_tokens = self.data["num_decode_tokens"].iloc[:num_requests].tolist()
+        for i, (input_len, output_len) in enumerate(
+            zip(num_prefill_tokens, num_decode_tokens)
+        ):
+            # Similar logic as in `BurstGPTDataset`
+            lora_req, tokenizer = self.get_random_lora_request(
+                tokenizer=tokenizer, max_loras=max_loras, lora_path=lora_path
+            )
+            vocab_size = tokenizer.vocab_size
+            # Generate a synthetic prompt: a list of token IDs computed as (i +
+            # j) modulo vocab_size.
+            token_ids = [(i + j) % vocab_size for j in range(input_len)]
+            prompt = tokenizer.decode(token_ids)
+            samples.append(
+                SampleRequest(
+                    prompt=prompt,
+                    prompt_len=input_len,
+                    expected_output_len=output_len,
+                    lora_request=lora_req,
+                )
+            )
+        return samples
+
+    def get_arrived_at(
+        self,
+        num_requests,
+    ) -> list[float]:
+        return self.data["arrived_at"].iloc[:num_requests].tolist()

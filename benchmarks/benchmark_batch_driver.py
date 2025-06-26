@@ -76,11 +76,12 @@ def gen_from_trace(
                 decode_lens.append(num_computed_tokens[i] + chunk_sizes[i])
 
             for freq in test_freqs:
+                tag = f"requests_{len(decode_lens) + len(prefill_lens)}_batch_{len(params):06d}_freq{freq}"  # noqa: E501
                 p = BenchmarkBatchParam(
                     prefill_input_lens=prefill_lens,
                     prefill_completed_input_lens=prefill_computed_lens,
                     decode_input_lens=decode_lens,
-                    log_dir=f"{log_dir_base}/logs/requests_{len(decode_lens) + len(prefill_lens)}_batch_{len(params):06d}_freq{freq}",
+                    log_dir=f"{log_dir_base}/logs/{tag}",
                     gpu_freq_mhz=freq,
                     min_num_iters=10,
                     min_seconds=1,
