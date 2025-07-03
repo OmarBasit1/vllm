@@ -38,6 +38,8 @@ class SchedulerStats:
     # Number of tokens that have upto now been computed for each request
     num_computed_tokens_list: list[int] = field(default_factory=list)
     num_prompt_tokens_list: list[int] = field(default_factory=list)
+    # The token budget used for the batch that completed
+    last_batch_token_budget: int = 0
 
     kv_cache_usage: float = 0.0
 
@@ -55,6 +57,7 @@ class SchedulerStats:
             "num_waiting_reqs": self.num_waiting_reqs,
             "num_computed_tokens_list": self.num_computed_tokens_list,
             "num_prompt_tokens_list": self.num_prompt_tokens_list,
+            "last_batch_token_budget_used": self.last_batch_token_budget,
             "kv_cache_usage": self.kv_cache_usage,
             "num_corrupted_reqs": self.num_corrupted_reqs,
         }

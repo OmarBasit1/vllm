@@ -168,6 +168,7 @@ class Scheduler(SchedulerInterface):
         # Added for logging
         self.num_computed_tokens: list[int] = []
         self.num_prompt_tokens: list[int] = []
+        self.token_budget_log: int = 0
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -613,6 +614,8 @@ class Scheduler(SchedulerInterface):
             self.requests[req_id].num_computed_tokens += num_scheduled_token
 
         self.finished_req_ids = set()
+        self.token_budget_log = self.max_num_scheduled_tokens - token_budget
+
         return scheduler_output
 
     def _make_cached_request_data(
@@ -1019,6 +1022,7 @@ class Scheduler(SchedulerInterface):
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
             num_computed_tokens_list=self.num_computed_tokens,
+            last_batch_token_budget=self.token_budget_log,
             num_prompt_tokens_list=self.num_prompt_tokens,
             kv_cache_usage=self.kv_cache_manager.usage,
             prefix_cache_stats=prefix_cache_stats,
