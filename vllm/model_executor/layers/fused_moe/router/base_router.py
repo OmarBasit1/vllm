@@ -161,11 +161,44 @@ class BaseRouter(FusedMoERouter):
         self.eplb_state = eplb_state
         self.enable_eplb = enable_eplb
         self.indices_type_getter = indices_type_getter
-        self.capture_fn: Callable[[torch.Tensor], None] | None = None
+        self.capture_fn: (
+            Callable[
+                [
+                    torch.Tensor,
+                    torch.Tensor | None,
+                    torch.Tensor,
+                    torch.Tensor | None,
+                ],
+                None,
+            ]
+            | None
+        ) = None
 
-    def set_capture_fn(self, capture_fn: Callable[[torch.Tensor], None] | None) -> None:
+    def set_capture_fn(
+        self,
+        capture_fn: Callable[
+            [
+                torch.Tensor,
+                torch.Tensor | None,
+                torch.Tensor,
+                torch.Tensor | None,
+            ],
+            None,
+        ]
+        | None,
+    ) -> None:
         """Set a capture callback for logical routed expert IDs."""
         self.capture_fn = capture_fn
+
+    def _compute_expert_probability_map(
+        self, router_logits: torch.Tensor
+    ) -> torch.Tensor | None:
+        scoring_func = getattr(self, "scoring_func", "softmax")
+        if scoring_func == "softmax":
+            return torch.softmax(router_logits, dim=-1)
+        if scoring_func == "sigmoid":
+            return torch.sigmoid(router_logits)
+        return None
 
     def _validate_eplb_state(self) -> None:
         """Validate that EPLB state is properly initialized if EPLB is enabled."""
@@ -278,7 +311,12 @@ class BaseRouter(FusedMoERouter):
 
         # Capture logical ids before EPLB mapping.
         if self.capture_fn is not None:
-            self.capture_fn(topk_ids)
+            self.capture_fn(
+                topk_ids,
+                topk_weights,
+                hidden_states,
+                self._compute_expert_probability_map(router_logits),
+            )
 
         # Step 4: Apply EPLB mapping
         topk_ids = self._apply_eplb_mapping(topk_ids)

@@ -3,7 +3,10 @@
 
 import math
 import time
+import zlib
 
+import msgspec
+import numpy as np
 import pytest
 
 from tests.v1.engine.utils import (
@@ -26,7 +29,11 @@ from vllm.v1.engine import (
     EngineCoreRequest,
     FinishReason,
 )
-from vllm.v1.engine.output_processor import OutputProcessor, RequestOutputCollector
+from vllm.v1.engine.output_processor import (
+    MoERequestLogger,
+    OutputProcessor,
+    RequestOutputCollector,
+)
 from vllm.v1.metrics.stats import IterationStats, SchedulerStats
 
 
@@ -44,6 +51,157 @@ def _ref_convert_id_to_token(
       String representation of input token id
     """
     return tokenizer.decode([token_id]) or ""
+
+
+def test_moe_iteration_layers_include_expert_probabilities():
+    routed_experts = np.array(
+        [
+            [[1, 2], [3, 4]],
+            [[5, 6], [7, 8]],
+            [[9, 10], [11, 12]],
+        ],
+        dtype=np.int32,
+    )
+    routed_expert_probabilities = np.array(
+        [
+            [[0.05, 0.95, 0.90, 0.40, 0.80, 0.70, 0.20, 0.30],
+             [0.03, 0.02, 0.90, 0.80, 0.70, 0.20, 0.10, 0.01]],
+            [[0.05, 0.10, 0.20, 0.30, 0.40, 0.91, 0.92, 0.01],
+             [0.04, 0.05, 0.01, 0.02, 0.03, 0.06, 0.85, 0.95]],
+            [[0.01, 0.02, 0.03, 0.04, 0.05, 0.95, 0.96, 0.99],
+             [0.02, 0.03, 0.04, 0.05, 0.98, 0.97, 0.06, 0.01]],
+        ],
+        dtype=np.float16,
+    )
+    routed_layer0_input_embeddings = np.array(
+        [
+            [0.11, 0.12, 0.13],
+            [0.21, 0.22, 0.23],
+            [0.31, 0.32, 0.33],
+        ],
+        dtype=np.float16,
+    )
+
+    out = MoERequestLogger.build_iteration_layers(
+        routed_experts,
+        routed_expert_probabilities,
+        routed_layer0_input_embeddings,
+        moe_iter_token_counts=[(0, 2), (1, 1)],
+    )
+
+    assert out is not None
+    assert len(out) == 2
+    first_layer = out[0]["layers"][0]
+    assert first_layer["expert_ids"] == [[1, 2], [5, 6]]
+    assert "expert_probabilities" in first_layer
+    assert np.allclose(
+        np.array(first_layer["expert_probabilities"], dtype=np.float32),
+        np.array(
+            [
+                    [0.05, 0.95, 0.90, 0.40, 0.80, 0.70, 0.20, 0.30],
+                [0.05, 0.10, 0.20, 0.30, 0.40, 0.91, 0.92, 0.01],
+            ],
+            dtype=np.float32,
+        ),
+        atol=1e-3,
+    )
+    assert np.allclose(
+        np.array(out[0]["layer0_input_embedding"], dtype=np.float32),
+        np.array([[0.11, 0.12, 0.13], [0.21, 0.22, 0.23]], dtype=np.float32),
+        atol=1e-3,
+    )
+
+    # top-k over full probability map reproduces routed experts.
+    recovered = np.argsort(
+        np.array(first_layer["expert_probabilities"], dtype=np.float32),
+        axis=1,
+    )[:, -2:]
+    recovered = np.sort(recovered, axis=1)
+    expected = np.sort(np.array(first_layer["expert_ids"], dtype=np.int32), axis=1)
+    assert np.array_equal(recovered, expected)
+
+
+def test_moe_iteration_layers_omit_probabilities_without_map():
+    routed_experts = np.array(
+        [
+            [[1, 2], [3, 4]],
+            [[5, 6], [7, 8]],
+        ],
+        dtype=np.int32,
+    )
+
+    out = MoERequestLogger.build_iteration_layers(
+        routed_experts,
+        None,
+        None,
+        moe_iter_token_counts=[(0, 2)],
+    )
+
+    assert out is not None
+    assert len(out) == 1
+    for layer in out[0]["layers"]:
+        assert "expert_probabilities" not in layer
+
+
+def test_moe_request_logger_writes_lossless_per_request_binary(tmp_path):
+    logger = MoERequestLogger(str(tmp_path))
+
+    record1 = {
+        "request_id": "req-1",
+        "internal_request_id": "internal-1",
+        "moe_expert_activation": [
+            {
+                "iter_no": 0,
+                "token_count": 1,
+                "layer0_input_embedding": [[0.25, 0.5]],
+                "layers": [
+                    {
+                        "layer_no": 0,
+                        "expert_ids": [[1, 3]],
+                        "expert_probabilities": [[0.1, 0.2, 0.3, 0.4]],
+                    }
+                ],
+            }
+        ],
+    }
+    record2 = {
+        "request_id": "req-2/with spaces",
+        "internal_request_id": "internal:2",
+        "moe_expert_activation": [
+            {
+                "iter_no": 1,
+                "token_count": 1,
+                "layer0_input_embedding": [[1.0, 2.0]],
+                "layers": [
+                    {
+                        "layer_no": 0,
+                        "expert_ids": [[2, 0]],
+                        "expert_probabilities": [[0.7, 0.2, 0.1, 0.0]],
+                    }
+                ],
+            }
+        ],
+    }
+
+    logger.log_record(record1)
+    logger.log_record(record2)
+    logger.close()
+
+    assert logger.path is not None
+    assert logger.path.name.endswith(".msgpack.zlib")
+
+    files = sorted(tmp_path.glob("*.msgpack.zlib"))
+    assert len(files) == 2
+
+    records_by_req_id = {}
+    for file_path in files:
+        raw = file_path.read_bytes()
+        decoded = zlib.decompress(raw)
+        loaded = msgspec.msgpack.decode(decoded)
+        records_by_req_id[loaded["request_id"]] = loaded
+
+    assert records_by_req_id[record1["request_id"]] == record1
+    assert records_by_req_id[record2["request_id"]] == record2
 
 
 @pytest.mark.parametrize(

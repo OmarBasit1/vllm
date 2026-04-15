@@ -53,6 +53,7 @@ from vllm.logger import init_logger
 from vllm.lora.layers import LoRAMapping, LoRAMappingType
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.fused_moe.moe_profiler import MoEProfiler
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
 )
@@ -431,6 +432,11 @@ class GPUModelRunner(
         # Set to True after init_routed_experts_capturer() completes.
         # Prevents routed experts code from running during profiling/dummy run.
         self.routed_experts_initialized = False
+        self.routed_experts_capturer: RoutedExpertsCapturer | None = None
+
+        # Set to True after init_moe_profiler() completes.
+        self.moe_profiling_initialized = False
+        self.moe_profiler: MoEProfiler | None = None
         self.max_model_len = model_config.max_model_len
 
         # Always set to false after the first forward pass
@@ -750,7 +756,7 @@ class GPUModelRunner(
         # - arange_np: immutable [0, 1, 2, ...] used as source for batched computation
         # - query_pos: CpuGpuBuffer for the computed batched arange result
         arange_size = max(self.max_num_reqs + 1, self.max_num_tokens)
-        self.arange_np = np.arange(arange_size, dtype=np.int64)
+        self.arange_np: np.ndarray = np.arange(arange_size, dtype=np.int64)
         self.query_pos = self._make_buffer(arange_size, dtype=torch.int64)
         self._arange_scratch = np.empty(arange_size, dtype=np.int64)
 
@@ -1857,7 +1863,7 @@ class GPUModelRunner(
         if self.input_batch.req_prompt_embeds:
             output_idx = 0
             for req_idx in range(num_reqs):
-                num_sched = num_scheduled_tokens[req_idx]
+                num_sched = int(num_scheduled_tokens[req_idx])
 
                 # Skip if this request doesn't have embeddings
                 if req_idx not in self.input_batch.req_prompt_embeds:
@@ -2591,13 +2597,15 @@ class GPUModelRunner(
 
         # Compute the logits indices.
         # [4, 1, 3, 1, 2]
-        num_sampled_tokens = num_draft_tokens + 1
+        num_sampled_tokens: np.ndarray = num_draft_tokens + 1
 
         # Step 1.
         # cu_num_sampled_tokens: [4, 5, 8, 9, 11]
         # _arange_scratch[:11]: [0, 1, 2, 3, 0, 0, 1, 2, 0, 0, 1]
         cu_num_sampled_tokens = self._get_cumsum_and_arange(
-            num_sampled_tokens, self._arange_scratch, cumsum_dtype=np.int32
+            num_sampled_tokens,
+            self._arange_scratch,
+            cumsum_dtype=np.dtype(np.int32),
         )
         # Step 2. [0, 0, 0, 0, 103, 104, 104, 104, 206, 207, 207]
         logits_indices = np.repeat(
@@ -2607,13 +2615,15 @@ class GPUModelRunner(
         logits_indices += self._arange_scratch[: cu_num_sampled_tokens[-1]]
 
         # Compute the bonus logits indices.
-        bonus_logits_indices = cu_num_sampled_tokens - 1
+        bonus_logits_indices: np.ndarray = cu_num_sampled_tokens - 1
 
         # Compute the draft logits indices.
         # cu_num_draft_tokens: [3, 3, 5, 5, 6]
         # _arange_scratch[:6]: [0, 1, 2, 0, 1, 0]
         cu_num_draft_tokens = self._get_cumsum_and_arange(
-            num_draft_tokens, self._arange_scratch, cumsum_dtype=np.int32
+            num_draft_tokens,
+            self._arange_scratch,
+            cumsum_dtype=np.dtype(np.int32),
         )
         # [0, 0, 0, 5, 5, 9]
         target_logits_indices = np.repeat(
@@ -3830,6 +3840,9 @@ class GPUModelRunner(
                     return EMPTY_MODEL_RUNNER_OUTPUT
                 return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
 
+            if self.moe_profiling_initialized and self.moe_profiler is not None:
+                self.moe_profiler.start_iteration()
+
             if self.cache_config.kv_sharing_fast_prefill:
                 assert not self.num_prompt_logprobs, (
                     "--kv-sharing-fast-prefill produces incorrect "
@@ -4044,10 +4057,14 @@ class GPUModelRunner(
                     assert isinstance(hidden_states, IntermediateTensors)
                     hidden_states.kv_connector_output = kv_connector_output
                     self.kv_connector_output = kv_connector_output
+                    if self.moe_profiling_initialized and self.moe_profiler is not None:
+                        self.moe_profiler.end_iteration()
                     return hidden_states
 
                 if self.is_pooling_model:
                     # Return the pooling output.
+                    if self.moe_profiling_initialized and self.moe_profiler is not None:
+                        self.moe_profiler.end_iteration()
                     return self._pool(
                         hidden_states,
                         num_scheduled_tokens,
@@ -4308,6 +4325,9 @@ class GPUModelRunner(
                 else:
                     logger.error("RoutedExpertsCapturer not initialized.")
 
+            if self.moe_profiling_initialized and self.moe_profiler is not None:
+                self.moe_profiler.end_iteration()
+
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
                 req_id_to_index=req_id_to_index_output_copy,
@@ -4347,6 +4367,10 @@ class GPUModelRunner(
             )
 
         return async_output
+
+    def shutdown(self) -> None:
+        if self.moe_profiler is not None:
+            self.moe_profiler.close()
 
     def _pp_broadcast_prev_sampled_token_ids(
         self, sampled_token_ids: torch.Tensor
@@ -6891,21 +6915,60 @@ class GPUModelRunner(
             max_num_kv_tokens=self.max_num_kv_tokens,
             vllm_config=self.vllm_config,
         )
-        self._bind_routed_experts_capturer(routed_experts_capturer)
+        self.routed_experts_capturer = routed_experts_capturer
+        self._bind_moe_capture_hooks()
         self.routed_experts_initialized = True
 
-    def _bind_routed_experts_capturer(self, capturer: RoutedExpertsCapturer) -> None:
+    def init_moe_profiler(self) -> None:
+        # Legacy chunk-based profiler is intentionally disabled.
+        # --enable-moe-profiling now only emits per-request JSONL logs.
+        logger.info(
+            "Legacy MoE chunk profiling is disabled; using request-level "
+            "moe_request_profile JSONL output only."
+        )
+        self.moe_profiler = None
+        self.moe_profiling_initialized = False
+
+    def _bind_moe_capture_hooks(self) -> None:
         from vllm.model_executor.layers.fused_moe.layer import FusedMoE
         from vllm.model_executor.layers.fused_moe.router.base_router import (
             BaseRouter,
         )
 
+        capturer = self.routed_experts_capturer
+        profiler = self.moe_profiler
+
         for module in self.compilation_config.static_forward_context.values():
             if isinstance(module, FusedMoE) and isinstance(module.router, BaseRouter):
                 layer_id = module.layer_id
 
-                def _capture_fn(topk_ids, _layer_id=layer_id, _capturer=capturer):
-                    _capturer.capture(_layer_id, topk_ids)
+                if capturer is None and profiler is None:
+                    module.router.set_capture_fn(None)
+                    continue
+
+                def _capture_fn(
+                    topk_ids: torch.Tensor,
+                    topk_weights: torch.Tensor | None,
+                    hidden_states: torch.Tensor,
+                    expert_probabilities: torch.Tensor | None,
+                    _layer_id=layer_id,
+                    _capturer=capturer,
+                    _profiler=profiler,
+                ):
+                    if _capturer is not None:
+                        _capturer.capture(
+                            _layer_id,
+                            topk_ids,
+                            topk_weights,
+                            hidden_states,
+                            expert_probabilities,
+                        )
+                    if _profiler is not None:
+                        _profiler.log(
+                            layer_id=_layer_id,
+                            expert_ids=topk_ids,
+                            routing_weights=topk_weights,
+                        )
 
                 module.router.set_capture_fn(_capture_fn)
 

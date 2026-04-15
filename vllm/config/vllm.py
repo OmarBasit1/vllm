@@ -1758,6 +1758,9 @@ class VllmConfig:
             # Will be added by https://github.com/vllm-project/vllm/pull/38163
             unsupported.append("routed experts capture")
 
+        if self.observability_config.enable_moe_profiling:
+            unsupported.append("MoE profiling")
+
         if self.model_config is not None and self.model_config.logits_processors:
             unsupported.append("custom logits processors")
 

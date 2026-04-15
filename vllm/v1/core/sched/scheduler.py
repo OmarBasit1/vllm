@@ -256,12 +256,42 @@ class Scheduler(SchedulerInterface):
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
             self.perf_metrics = ModelMetrics(vllm_config)
 
+        self._moe_request_logging_enabled = (
+            self.observability_config.enable_moe_profiling
+            and self.vllm_config.model_config.is_moe
+        )
+        self._moe_iteration_counter = 0
+        self._moe_req_iteration_schedule: dict[str, list[tuple[int, int]]] = (
+            defaultdict(list)
+        )
+        self.routed_experts_reader: RoutedExpertsReader | None = None
+        self.routed_experts_attn_gid = 0
+        self.max_num_kv_tokens = 0
+
         if self.vllm_config.model_config.enable_return_routed_experts:
             assert self.dcp_world_size == 1 and self.pcp_world_size == 1, (
                 "enable_return_routed_experts does not support context parallelism "
                 "(dcp_world_size > 1 or pcp_world_size > 1)"
             )
 
+        need_routed_experts_reader = (
+            self.vllm_config.model_config.enable_return_routed_experts
+            or self._moe_request_logging_enabled
+        )
+        if (
+            need_routed_experts_reader
+            and (self.dcp_world_size != 1 or self.pcp_world_size != 1)
+        ):
+            logger.warning(
+                "Per-request MoE profiling logs are disabled because context "
+                "parallelism is enabled."
+            )
+            self._moe_request_logging_enabled = False
+            need_routed_experts_reader = (
+                self.vllm_config.model_config.enable_return_routed_experts
+            )
+
+        if need_routed_experts_reader:
             self.routed_experts_reader = RoutedExpertsReader.create()
 
             assert len(kv_cache_config.kv_cache_groups) > 0, (
@@ -1304,6 +1334,9 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        iteration_id = self._moe_iteration_counter
+        self._moe_iteration_counter += 1
+
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
@@ -1358,6 +1391,11 @@ class Scheduler(SchedulerInterface):
                 # In this case, we use is_finished() to check.
                 continue
 
+            if self._moe_request_logging_enabled:
+                self._moe_req_iteration_schedule[req_id].append(
+                    (iteration_id, int(num_tokens_scheduled))
+                )
+
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
@@ -1407,15 +1445,33 @@ class Scheduler(SchedulerInterface):
                 stopped = True
 
             routed_experts = None
+            routed_expert_probabilities = None
+            routed_layer0_input_embeddings = None
+            moe_iter_token_counts = None
             finish_reason = None
             if stopped:
-                routed_experts = self._get_routed_experts(request)
+                (
+                    routed_experts,
+                    routed_expert_probabilities,
+                    routed_layer0_input_embeddings,
+                ) = (
+                    self._get_routed_expert_profile(request)
+                )
 
                 # Capture finish_reason BEFORE _handle_stopped_request, which may
                 # reset the status to WAITING for streaming requests that continue.
                 finish_reason = request.get_finished_reason()
                 finished = self._handle_stopped_request(request)
                 if finished:
+                    if self._moe_request_logging_enabled:
+                        expected_tokens = (
+                            int(routed_experts.shape[0])
+                            if routed_experts is not None
+                            else None
+                        )
+                        moe_iter_token_counts = self._consume_moe_iteration_schedule(
+                            req_id, expected_tokens
+                        )
                     kv_transfer_params = self._free_request(request)
 
                 if status_before_stop == RequestStatus.RUNNING:
@@ -1470,6 +1526,9 @@ class Scheduler(SchedulerInterface):
                         num_cached_tokens=request.num_cached_tokens,
                         num_external_computed_tokens=request.num_external_computed_tokens,
                         routed_experts=routed_experts,
+                        routed_expert_probabilities=routed_expert_probabilities,
+                        routed_layer0_input_embeddings=routed_layer0_input_embeddings,
+                        moe_iter_token_counts=moe_iter_token_counts,
                         num_nans_in_logits=request.num_nans_in_logits,
                     )
                 )
@@ -1599,9 +1658,11 @@ class Scheduler(SchedulerInterface):
         self._enqueue_waiting_request(request)
         return False
 
-    def _get_routed_experts(self, request: Request) -> np.ndarray | None:
-        if not self.vllm_config.model_config.enable_return_routed_experts:
-            return None
+    def _get_routed_expert_profile(
+        self, request: Request
+    ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+        if self.routed_experts_reader is None:
+            return None, None, None
 
         kv_blocks = self.kv_cache_manager.get_blocks(request.request_id)
         block_ids = kv_blocks.get_block_ids()[self.routed_experts_attn_gid]
@@ -1622,7 +1683,46 @@ class Scheduler(SchedulerInterface):
             + block_ids_array.reshape((num_blocks, 1)) * block_size
         ).flatten()[:num_tokens]
 
-        return self.routed_experts_reader.get_routed_experts(indices=slot_mapping)
+        routed_experts = self.routed_experts_reader.get_routed_experts(
+            indices=slot_mapping
+        )
+        routed_expert_probabilities = (
+            self.routed_experts_reader.get_routed_expert_probabilities(
+                indices=slot_mapping
+            )
+        )
+        layer0_input_embeddings = (
+            self.routed_experts_reader.get_layer0_input_embeddings(
+                indices=slot_mapping
+            )
+        )
+        return routed_experts, routed_expert_probabilities, layer0_input_embeddings
+
+    def _consume_moe_iteration_schedule(
+        self, req_id: str, expected_tokens: int | None = None
+    ) -> list[tuple[int, int]] | None:
+        history = self._moe_req_iteration_schedule.pop(req_id, None)
+        if not history:
+            return None
+
+        if expected_tokens is None:
+            return history
+
+        remaining = max(0, expected_tokens)
+        trimmed: list[tuple[int, int]] = []
+        for iter_id, token_count in history:
+            if remaining <= 0:
+                break
+            use_count = min(token_count, remaining)
+            if use_count > 0:
+                trimmed.append((iter_id, use_count))
+                remaining -= use_count
+
+        if remaining > 0:
+            fallback_iter = history[-1][0]
+            trimmed.append((fallback_iter, remaining))
+
+        return trimmed
 
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int]
@@ -1826,6 +1926,7 @@ class Scheduler(SchedulerInterface):
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
+        self._moe_req_iteration_schedule.pop(request_id, None)
 
         delay_free_blocks |= connector_delay_free_blocks
         if not delay_free_blocks:

@@ -76,6 +76,17 @@ class ObservabilityConfig:
     This includes number of context/generation requests and tokens
     and the elapsed cpu time for the iteration."""
 
+    enable_moe_profiling: bool = False
+    """Enable lightweight MoE routing profiling.
+
+    When enabled, per-iteration routed expert IDs (and, when available,
+    routing weights) are captured in worker processes and written to disk in
+    periodic buffered chunks.
+    """
+
+    moe_profiling_log_dir: str = "./vllm_moe_profiles"
+    """Directory used by workers to store MoE profiling logs."""
+
     @cached_property
     def collect_model_forward_time(self) -> bool:
         """Whether to collect model forward time for the request."""
@@ -141,6 +152,14 @@ class ObservabilityConfig:
         string instead of a list of strings."""
         if value is not None and len(value) == 1 and "," in value[0]:
             value = cast(list[DetailedTraceModules], value[0].split(","))
+        return value
+
+    @field_validator("moe_profiling_log_dir")
+    @classmethod
+    def _validate_moe_profiling_log_dir(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("moe_profiling_log_dir must not be empty.")
         return value
 
     @model_validator(mode="after")

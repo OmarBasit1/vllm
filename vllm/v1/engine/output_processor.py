@@ -2,11 +2,19 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import os
+import queue
+import re
+import threading
+import zlib
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, cast
 
+import msgspec
 import numpy as np
 import torch
 
@@ -124,6 +132,243 @@ class StreamingUpdate:
     prompt_token_ids: list[int] | None
     arrival_time: float
     final: bool = False
+
+
+class MoERequestLogger:
+    """Asynchronous per-request binary logger for MoE profiling records."""
+
+    _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+    def __init__(self, log_dir: str) -> None:
+        self._log_dir = Path(log_dir).expanduser()
+        self._log_dir.mkdir(parents=True, exist_ok=True)
+        self._pid = os.getpid()
+        self._session_ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        self._file_index = 0
+        self._state_lock = threading.Lock()
+        self._closed = False
+        self._worker_error: Exception | None = None
+        self._write_queue: queue.Queue[dict[str, Any] | None] = queue.Queue(maxsize=0)
+        self._workers: list[threading.Thread] = []
+        self.path: Path | None = None
+
+        worker_count = self._resolve_worker_count()
+        for worker_idx in range(worker_count):
+            worker = threading.Thread(
+                target=self._writer_loop,
+                name=f"moe-request-log-writer-{worker_idx}",
+                daemon=True,
+            )
+            worker.start()
+            self._workers.append(worker)
+
+    @staticmethod
+    def _resolve_worker_count() -> int:
+        default_workers = min(12, max(1, os.cpu_count() or 1))
+        env_value = os.getenv("VLLM_MOE_PROFILE_WRITER_THREADS")
+        if env_value is None:
+            return default_workers
+        try:
+            return max(1, int(env_value))
+        except ValueError:
+            return default_workers
+
+    @classmethod
+    def _sanitize_component(cls, value: Any) -> str:
+        text = str(value)
+        text = cls._SAFE_NAME_RE.sub("_", text).strip("._-")
+        if not text:
+            return "unknown"
+        return text[:80]
+
+    @staticmethod
+    def build_iteration_layers(
+        routed_experts: np.ndarray | None,
+        routed_expert_probabilities: np.ndarray | None,
+        routed_layer0_input_embeddings: np.ndarray | None,
+        moe_iter_token_counts: list[tuple[int, int]] | None,
+    ) -> list[dict[str, Any]] | None:
+        if routed_experts is None or moe_iter_token_counts is None:
+            return None
+        if routed_experts.ndim != 3:
+            return None
+
+        include_expert_probabilities = (
+            routed_expert_probabilities is not None
+            and routed_expert_probabilities.ndim == 3
+            and routed_expert_probabilities.shape[:2] == routed_experts.shape[:2]
+        )
+        include_layer0_input_embeddings = (
+            routed_layer0_input_embeddings is not None
+            and routed_layer0_input_embeddings.ndim == 2
+            and routed_layer0_input_embeddings.shape[0] == routed_experts.shape[0]
+        )
+
+        total_tokens = int(routed_experts.shape[0])
+        num_layers = int(routed_experts.shape[1])
+        offset = 0
+        iterations: list[dict[str, Any]] = []
+
+        for iter_no, token_count in moe_iter_token_counts:
+            if token_count <= 0 or offset >= total_tokens:
+                continue
+
+            end = min(offset + int(token_count), total_tokens)
+            token_slice = routed_experts[offset:end]
+            token_probability_slice = (
+                routed_expert_probabilities[offset:end]
+                if include_expert_probabilities
+                and routed_expert_probabilities is not None
+                else None
+            )
+            token_layer0_input_slice = (
+                routed_layer0_input_embeddings[offset:end]
+                if include_layer0_input_embeddings
+                and routed_layer0_input_embeddings is not None
+                else None
+            )
+            layers = []
+            for layer_no in range(num_layers):
+                layer_record = {
+                    "layer_no": int(layer_no),
+                    "expert_ids": token_slice[:, layer_no, :].tolist(),
+                }
+                if token_probability_slice is not None:
+                    layer_record["expert_probabilities"] = (
+                        token_probability_slice[:, layer_no, :].tolist()
+                    )
+                layers.append(layer_record)
+            iterations.append(
+                {
+                    "iter_no": int(iter_no),
+                    "token_count": int(end - offset),
+                    "layer0_input_embedding": (
+                        token_layer0_input_slice.tolist()
+                        if token_layer0_input_slice is not None
+                        else None
+                    ),
+                    "layers": layers,
+                }
+            )
+            offset = end
+
+        if offset < total_tokens:
+            token_slice = routed_experts[offset:total_tokens]
+            fallback_iter = (
+                int(moe_iter_token_counts[-1][0]) if moe_iter_token_counts else -1
+            )
+            token_probability_slice = (
+                routed_expert_probabilities[offset:total_tokens]
+                if include_expert_probabilities
+                and routed_expert_probabilities is not None
+                else None
+            )
+            token_layer0_input_slice = (
+                routed_layer0_input_embeddings[offset:total_tokens]
+                if include_layer0_input_embeddings
+                and routed_layer0_input_embeddings is not None
+                else None
+            )
+            layers = []
+            for layer_no in range(num_layers):
+                layer_record = {
+                    "layer_no": int(layer_no),
+                    "expert_ids": token_slice[:, layer_no, :].tolist(),
+                }
+                if token_probability_slice is not None:
+                    layer_record["expert_probabilities"] = (
+                        token_probability_slice[:, layer_no, :].tolist()
+                    )
+                layers.append(layer_record)
+            iterations.append(
+                {
+                    "iter_no": fallback_iter,
+                    "token_count": int(total_tokens - offset),
+                    "layer0_input_embedding": (
+                        token_layer0_input_slice.tolist()
+                        if token_layer0_input_slice is not None
+                        else None
+                    ),
+                    "layers": layers,
+                }
+            )
+
+        return iterations
+
+    def _raise_if_worker_failed(self) -> None:
+        with self._state_lock:
+            worker_error = self._worker_error
+        if worker_error is not None:
+            raise RuntimeError("MoE request log writer thread failed") from worker_error
+
+    def _get_next_paths(self, record: dict[str, Any]) -> tuple[Path, Path]:
+        req_id = self._sanitize_component(record.get("request_id", "unknown"))
+        internal_req_id = self._sanitize_component(
+            record.get("internal_request_id", "unknown")
+        )
+        with self._state_lock:
+            file_idx = self._file_index
+            self._file_index += 1
+
+        file_name = (
+            f"moe_request_profile_pid{self._pid}_ts{self._session_ts}"
+            f"_idx{file_idx:09d}_req{req_id}_ireq{internal_req_id}.msgpack.zlib"
+        )
+        target_path = self._log_dir / file_name
+        temp_path = self._log_dir / f".{file_name}.tmp"
+        return target_path, temp_path
+
+    def _write_record(
+        self,
+        record: dict[str, Any],
+        encoder: msgspec.msgpack.Encoder,
+    ) -> None:
+        target_path, temp_path = self._get_next_paths(record)
+        payload = encoder.encode(record)
+        compressed_payload = zlib.compress(payload, level=5)
+        with temp_path.open("wb") as f:
+            f.write(compressed_payload)
+        os.replace(temp_path, target_path)
+        with self._state_lock:
+            self.path = target_path
+
+    def _writer_loop(self) -> None:
+        encoder = msgspec.msgpack.Encoder()
+        while True:
+            queued_item = self._write_queue.get()
+            try:
+                if queued_item is None:
+                    return
+                self._write_record(queued_item, encoder)
+            except Exception as exc:
+                with self._state_lock:
+                    if self._worker_error is None:
+                        self._worker_error = exc
+            finally:
+                self._write_queue.task_done()
+
+    def log_record(self, record: dict[str, Any]) -> None:
+        with self._state_lock:
+            if self._closed:
+                raise RuntimeError("MoERequestLogger is already closed")
+        self._raise_if_worker_failed()
+        self._write_queue.put_nowait(record)
+
+    def close(self) -> None:
+        with self._state_lock:
+            if self._closed:
+                return
+            self._closed = True
+
+        for _ in self._workers:
+            self._write_queue.put(None)
+
+        self._write_queue.join()
+
+        for worker in self._workers:
+            worker.join(timeout=5.0)
+
+        self._raise_if_worker_failed()
 
 
 class RequestState:
@@ -420,6 +665,8 @@ class OutputProcessor:
         log_stats: bool,
         stream_interval: int = 1,
         tracing_enabled: bool = False,
+        enable_moe_profiling: bool = False,
+        moe_profiling_log_dir: str = "./vllm_moe_profiles",
     ):
         self.log_stats = log_stats
         self.tokenizer = tokenizer
@@ -429,6 +676,9 @@ class OutputProcessor:
         self.external_req_ids: defaultdict[str, list[str]] = defaultdict(list)
         self.lora_states = LoRARequestStates(log_stats)
         self.tracing_enabled = tracing_enabled
+        self.moe_request_logger: MoERequestLogger | None = None
+        if enable_moe_profiling:
+            self.moe_request_logger = MoERequestLogger(moe_profiling_log_dir)
 
     def get_num_unfinished_requests(self):
         return len(self.request_states)
@@ -663,6 +913,7 @@ class OutputProcessor:
                     else:
                         req_state.input_chunk_queue = None
                 else:
+                    self._maybe_log_moe_request(req_state, engine_core_output)
                     self._finish_request(req_state)
                     if not engine_core_output.finished:
                         # If req not finished in EngineCore, but Detokenizer
@@ -680,6 +931,33 @@ class OutputProcessor:
             request_outputs=request_outputs,
             reqs_to_abort=reqs_to_abort,
         )
+
+    def _maybe_log_moe_request(
+        self, req_state: RequestState, engine_core_output: EngineCoreOutput
+    ) -> None:
+        logger = self.moe_request_logger
+        if logger is None:
+            return
+
+        record = {
+            "request_id": req_state.external_req_id,
+            "internal_request_id": req_state.request_id,
+            # "input": {
+            #     "text": prompt_text,
+            #     "token_ids": prompt_token_ids,
+            # },
+            # "output": {
+            #     "text": output_text,
+            #     "token_ids": output_token_ids,
+            # },
+            "moe_expert_activation": MoERequestLogger.build_iteration_layers(
+                engine_core_output.routed_experts,
+                engine_core_output.routed_expert_probabilities,
+                engine_core_output.routed_layer0_input_embeddings,
+                engine_core_output.moe_iter_token_counts,
+            ),
+        }
+        logger.log_record(record)
 
     def _finish_request(self, req_state: RequestState) -> None:
         req_id = req_state.request_id
@@ -805,3 +1083,7 @@ class OutputProcessor:
         ParentRequest.observe_finished_request(
             req_state.parent_req, iteration_stats, req_state.stats.num_generation_tokens
         )
+
+    def __del__(self):
+        if self.moe_request_logger is not None:
+            self.moe_request_logger.close()

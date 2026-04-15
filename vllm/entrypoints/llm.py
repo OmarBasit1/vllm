@@ -182,6 +182,9 @@ class LLM:
             disable CUDA graph and always execute the model in eager mode.
             If False, we will use CUDA graph and eager execution in hybrid.
         enable_return_routed_experts: Whether to return routed experts.
+        enable_moe_profiling: Whether to enable lightweight MoE profiling
+            that logs routed experts per layer and iteration to disk.
+        moe_profiling_log_dir: Directory where MoE profiling files are written.
         disable_custom_all_reduce: See
             [ParallelConfig][vllm.config.ParallelConfig].
         hf_token: The token to use as HTTP bearer authorization for remote files
@@ -238,6 +241,8 @@ class LLM:
         offload_params: set[str] | None = None,
         enforce_eager: bool = False,
         enable_return_routed_experts: bool = False,
+        enable_moe_profiling: bool = False,
+        moe_profiling_log_dir: str = "./vllm_moe_profiles",
         disable_custom_all_reduce: bool = False,
         hf_token: bool | str | None = None,
         hf_overrides: HfOverrides | None = None,
@@ -364,6 +369,8 @@ class LLM:
             offload_params=offload_params or set(),
             enforce_eager=enforce_eager,
             enable_return_routed_experts=enable_return_routed_experts,
+            enable_moe_profiling=enable_moe_profiling,
+            moe_profiling_log_dir=moe_profiling_log_dir,
             disable_custom_all_reduce=disable_custom_all_reduce,
             hf_token=hf_token,
             hf_overrides=hf_overrides,

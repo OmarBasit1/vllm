@@ -90,3 +90,22 @@ def test_defaults_with_usage_context():
     vllm_config = engine_args.create_engine_config(UsageContext.OPENAI_API_SERVER)
     assert vllm_config.scheduler_config.max_num_seqs == default_max_num_seqs
     assert vllm_config.scheduler_config.max_num_batched_tokens == default_server_tokens  # noqa: E501
+
+
+def test_moe_profiling_args_from_cli(tmp_path):
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+
+    args = parser.parse_args([])
+    engine_args = EngineArgs.from_cli_args(args=args)
+    assert not engine_args.enable_moe_profiling
+
+    args = parser.parse_args(
+        [
+            "--enable-moe-profiling",
+            "--moe-profiling-log-dir",
+            str(tmp_path),
+        ]
+    )
+    engine_args = EngineArgs.from_cli_args(args=args)
+    assert engine_args.enable_moe_profiling
+    assert engine_args.moe_profiling_log_dir == str(tmp_path)

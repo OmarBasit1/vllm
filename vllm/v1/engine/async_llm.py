@@ -148,6 +148,11 @@ class AsyncLLM(EngineClient):
             log_stats=self.log_stats,
             stream_interval=self.vllm_config.scheduler_config.stream_interval,
             tracing_enabled=tracing_endpoint is not None,
+            enable_moe_profiling=(
+                self.observability_config.enable_moe_profiling
+                and self.model_config.is_moe
+            ),
+            moe_profiling_log_dir=self.observability_config.moe_profiling_log_dir,
         )
 
         # EngineCore (starts the engine in background process).

@@ -28,6 +28,8 @@ logger = logging.getLogger(__name__)
 _TMP_DIR = tempfile.gettempdir()
 _LOCK_FILE_PREFIX = os.path.join(_TMP_DIR, "vllm_routed_experts")
 _BUFFER_PREFIX = "vllm_routed_experts_buffer"
+_PROBABILITY_BUFFER_PREFIX = "vllm_routed_experts_probability_buffer"
+_LAYER0_INPUT_BUFFER_PREFIX = "vllm_routed_experts_layer0_input_buffer"
 
 # Global singleton instances
 _global_experts_capturer: RoutedExpertsCapturer | None = None
@@ -88,8 +90,16 @@ class RoutedExpertsCapturer:
 
     def __init__(self) -> None:
         self._device_buffer: torch.Tensor | None = None
+        self._device_probability_buffer: torch.Tensor | None = None
+        self._device_layer0_input_buffer: torch.Tensor | None = None
+        self._num_experts = 0
+        self._hidden_size = 0
         self._shm: shared_memory.SharedMemory | None = None
+        self._probability_shm: shared_memory.SharedMemory | None = None
+        self._layer0_input_shm: shared_memory.SharedMemory | None = None
         self._host_buffer_view: np.ndarray | None = None
+        self._host_probability_buffer_view: np.ndarray | None = None
+        self._host_layer0_input_buffer_view: np.ndarray | None = None
         self._lock_file: str | None = None
 
     @classmethod
@@ -128,11 +138,29 @@ class RoutedExpertsCapturer:
         hf_config = vllm_config.model_config.hf_text_config
         num_layers = hf_config.num_hidden_layers
         num_experts_per_tok = hf_config.num_experts_per_tok
+        num_experts = int(vllm_config.model_config.get_num_experts())
+        if num_experts <= 0:
+            raise ValueError("num_experts must be > 0 for MoE routed expert capture")
+        self._num_experts = num_experts
+        hidden_size = int(vllm_config.model_config.get_hidden_size())
+        if hidden_size <= 0:
+            raise ValueError("hidden_size must be > 0 for MoE routed expert capture")
+        self._hidden_size = hidden_size
 
         # Initialize device buffer
         self._device_buffer = torch.zeros(
             (max_num_batched_tokens, num_layers, num_experts_per_tok),
             dtype=torch.int32,
+            device=current_platform.device_type,
+        )
+        self._device_probability_buffer = torch.zeros(
+            (max_num_batched_tokens, num_layers, num_experts),
+            dtype=torch.float16,
+            device=current_platform.device_type,
+        )
+        self._device_layer0_input_buffer = torch.zeros(
+            (max_num_batched_tokens, hidden_size),
+            dtype=torch.float16,
             device=current_platform.device_type,
         )
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
@@ -142,16 +170,50 @@ class RoutedExpertsCapturer:
 
         # Initialize shared memory
         shape = (max_num_kv_tokens, num_layers, num_experts_per_tok)
+        probability_shape = (max_num_kv_tokens, num_layers, num_experts)
+        layer0_input_shape = (max_num_kv_tokens, hidden_size)
         buffer_size = int(np.prod(shape)) * np.dtype(np.int32).itemsize
+        probability_buffer_size = (
+            int(np.prod(probability_shape)) * np.dtype(np.float16).itemsize
+        )
+        layer0_input_buffer_size = (
+            int(np.prod(layer0_input_shape)) * np.dtype(np.float16).itemsize
+        )
         instance_id = vllm_config.instance_id
         self._lock_file = f"{_LOCK_FILE_PREFIX}_{instance_id}_{self.dp_rank}.lock"
         shm_name = f"{_BUFFER_PREFIX}_{instance_id}_{self.dp_rank}"
+        probability_shm_name = (
+            f"{_PROBABILITY_BUFFER_PREFIX}_{instance_id}_{self.dp_rank}"
+        )
+        layer0_input_shm_name = (
+            f"{_LAYER0_INPUT_BUFFER_PREFIX}_{instance_id}_{self.dp_rank}"
+        )
 
         self._shm = _create_or_attach_shared_memory(
             shm_name, buffer_size, self._lock_file
         )
+        self._probability_shm = _create_or_attach_shared_memory(
+            probability_shm_name, probability_buffer_size, self._lock_file
+        )
+        self._layer0_input_shm = _create_or_attach_shared_memory(
+            layer0_input_shm_name,
+            layer0_input_buffer_size,
+            self._lock_file,
+        )
         self._host_buffer_view = np.ndarray(shape, dtype=np.int32, buffer=self._shm.buf)
+        self._host_probability_buffer_view = np.ndarray(
+            probability_shape,
+            dtype=np.float16,
+            buffer=self._probability_shm.buf,
+        )
+        self._host_layer0_input_buffer_view = np.ndarray(
+            layer0_input_shape,
+            dtype=np.float16,
+            buffer=self._layer0_input_shm.buf,
+        )
         self._host_buffer_view.fill(0)
+        self._host_probability_buffer_view.fill(0)
+        self._host_layer0_input_buffer_view.fill(0)
 
         logger.debug(
             "Created shared memory buffer '%s' with shape %s",
@@ -159,16 +221,35 @@ class RoutedExpertsCapturer:
             shape,
         )
 
-    def capture(self, layer_id: int, topk_ids: torch.Tensor) -> None:
+    def capture(
+        self,
+        layer_id: int,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor | None = None,
+        hidden_states: torch.Tensor | None = None,
+        expert_probabilities: torch.Tensor | None = None,
+    ) -> None:
         """
         Capture expert routing decisions for a specific layer.
 
         Args:
             layer_id: The layer index.
             topk_ids: Tensor of shape (batch_size, num_routed_experts).
+            topk_weights: Optional routing weights for selected experts.
+            hidden_states: Optional layer input embeddings (batch_size, hidden_size).
+            expert_probabilities: Optional full expert probability map
+                (batch_size, num_experts).
         """
         if self._device_buffer is None:
             raise RuntimeError("Buffer not initialized. Call init_buffer() first.")
+        if self._device_probability_buffer is None:
+            raise RuntimeError(
+                "Probability buffer not initialized. Call init_buffer() first."
+            )
+        if self._device_layer0_input_buffer is None:
+            raise RuntimeError(
+                "Layer-0 input buffer not initialized. Call init_buffer() first."
+            )
 
         ctx = get_forward_context()
         if ctx.dp_metadata is None:  # single dp
@@ -185,14 +266,59 @@ class RoutedExpertsCapturer:
         if layer_id >= self._device_buffer.shape[1]:
             return
 
-        self._device_buffer[:token_num_per_dp, layer_id, :] = topk_ids[
-            start_loc:end_loc, :
-        ]
+        topk_ids_for_dp = topk_ids[start_loc:end_loc, :]
+        self._device_buffer[:token_num_per_dp, layer_id, :] = topk_ids_for_dp
+
+        if layer_id == 0 and hidden_states is not None:
+            layer0_input_for_dp = hidden_states[start_loc:end_loc, :]
+            self._device_layer0_input_buffer[:token_num_per_dp, :] = (
+                layer0_input_for_dp.to(dtype=self._device_layer0_input_buffer.dtype)
+            )
+
+        prob_slice = self._device_probability_buffer[:token_num_per_dp, layer_id, :]
+        prob_slice.zero_()
+
+        if expert_probabilities is not None:
+            prob_for_dp = expert_probabilities[start_loc:end_loc, :]
+            prob_slice.copy_(prob_for_dp.to(dtype=prob_slice.dtype), non_blocking=True)
+            return
+
+        topk_ids_long = topk_ids_for_dp.to(dtype=torch.long)
+        if topk_weights is None:
+            topk_weights_for_dp = torch.ones(
+                topk_ids_long.shape,
+                dtype=prob_slice.dtype,
+                device=topk_ids_long.device,
+            )
+        else:
+            topk_weights_for_dp = topk_weights[start_loc:end_loc, :].to(
+                dtype=prob_slice.dtype
+            )
+
+        valid_mask = (topk_ids_long >= 0) & (topk_ids_long < self._num_experts)
+        safe_ids = torch.where(
+            valid_mask,
+            topk_ids_long,
+            torch.zeros_like(topk_ids_long),
+        )
+        safe_weights = torch.where(
+            valid_mask,
+            topk_weights_for_dp,
+            torch.zeros_like(topk_weights_for_dp),
+        )
+        prob_slice.scatter_add_(1, safe_ids, safe_weights)
+
+        row_sum = prob_slice.sum(dim=1, keepdim=True)
+        prob_slice.div_(torch.where(row_sum > 0, row_sum, torch.ones_like(row_sum)))
 
     def clear_buffer(self) -> None:
         """Clear the device buffer."""
         if self._device_buffer is not None:
             self._device_buffer.zero_()
+        if self._device_probability_buffer is not None:
+            self._device_probability_buffer.zero_()
+        if self._device_layer0_input_buffer is not None:
+            self._device_layer0_input_buffer.zero_()
 
     def save_captured_experts(self, indices: np.ndarray) -> None:
         """
@@ -207,14 +333,30 @@ class RoutedExpertsCapturer:
             raise RuntimeError("Shared memory not initialized.")
         if self._host_buffer_view is None:
             return
+        if self._host_probability_buffer_view is None:
+            return
+        if self._host_layer0_input_buffer_view is None:
+            return
         if self._device_buffer is None:
             raise RuntimeError("Device buffer not initialized.")
+        if self._device_probability_buffer is None:
+            raise RuntimeError("Probability device buffer not initialized.")
+        if self._device_layer0_input_buffer is None:
+            raise RuntimeError("Layer-0 input device buffer not initialized.")
 
         num_tokens = len(indices)
         data = self._device_buffer[:num_tokens, :, :].cpu().numpy()
+        probability_data = self._device_probability_buffer[
+            :num_tokens, :, :
+        ].cpu().numpy()
+        layer0_input_data = self._device_layer0_input_buffer[
+            :num_tokens, :
+        ].cpu().numpy()
 
         with _file_lock(self._lock_file):
             self._host_buffer_view[indices, :, :] = data
+            self._host_probability_buffer_view[indices, :, :] = probability_data
+            self._host_layer0_input_buffer_view[indices, :] = layer0_input_data
 
     def cleanup(self) -> None:
         """Explicitly clean up shared memory resources."""
@@ -226,6 +368,28 @@ class RoutedExpertsCapturer:
                 logger.debug("Exception during cleanup for capturer", exc_info=True)
             finally:
                 self._shm = None
+        if self._probability_shm is not None:
+            try:
+                self._probability_shm.close()
+                self._probability_shm.unlink()
+            except Exception:
+                logger.debug(
+                    "Exception during probability cleanup for capturer",
+                    exc_info=True,
+                )
+            finally:
+                self._probability_shm = None
+        if self._layer0_input_shm is not None:
+            try:
+                self._layer0_input_shm.close()
+                self._layer0_input_shm.unlink()
+            except Exception:
+                logger.debug(
+                    "Exception during layer-0 input cleanup for capturer",
+                    exc_info=True,
+                )
+            finally:
+                self._layer0_input_shm = None
 
     def __del__(self) -> None:
         """Clean up shared memory on destruction."""
@@ -244,7 +408,11 @@ class RoutedExpertsReader:
 
     def __init__(self) -> None:
         self._shm: shared_memory.SharedMemory | None = None
+        self._probability_shm: shared_memory.SharedMemory | None = None
+        self._layer0_input_shm: shared_memory.SharedMemory | None = None
         self._host_buffer_view: np.ndarray | None = None
+        self._host_probability_buffer_view: np.ndarray | None = None
+        self._host_layer0_input_buffer_view: np.ndarray | None = None
         self._lock_file: str | None = None
 
     @classmethod
@@ -281,16 +449,34 @@ class RoutedExpertsReader:
             return  # Already attached
 
         hf_config = vllm_config.model_config.hf_text_config
+        num_experts = int(vllm_config.model_config.get_num_experts())
+        if num_experts <= 0:
+            raise ValueError("num_experts must be > 0 for MoE routed expert capture")
+        hidden_size = int(vllm_config.model_config.get_hidden_size())
+        if hidden_size <= 0:
+            raise ValueError("hidden_size must be > 0 for MoE routed expert capture")
         shape = (
             max_num_kv_tokens,
             hf_config.num_hidden_layers,
             hf_config.num_experts_per_tok,
         )
+        probability_shape = (
+            max_num_kv_tokens,
+            hf_config.num_hidden_layers,
+            num_experts,
+        )
+        layer0_input_shape = (max_num_kv_tokens, hidden_size)
 
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
         instance_id = vllm_config.instance_id
         self._lock_file = f"{_LOCK_FILE_PREFIX}_{instance_id}_{self.dp_rank}.lock"
         shm_name = f"{_BUFFER_PREFIX}_{instance_id}_{self.dp_rank}"
+        probability_shm_name = (
+            f"{_PROBABILITY_BUFFER_PREFIX}_{instance_id}_{self.dp_rank}"
+        )
+        layer0_input_shm_name = (
+            f"{_LAYER0_INPUT_BUFFER_PREFIX}_{instance_id}_{self.dp_rank}"
+        )
 
         with _file_lock(self._lock_file, mode="rb+"):
             # Avoid resource_tracker registering the shared memory
@@ -299,9 +485,25 @@ class RoutedExpertsReader:
                 lambda *args, **kwargs: None,
             ):
                 self._shm = shared_memory.SharedMemory(name=shm_name)
+                self._probability_shm = shared_memory.SharedMemory(
+                    name=probability_shm_name
+                )
+                self._layer0_input_shm = shared_memory.SharedMemory(
+                    name=layer0_input_shm_name
+                )
 
             self._host_buffer_view = np.ndarray(
                 shape, dtype=np.int32, buffer=self._shm.buf
+            )
+            self._host_probability_buffer_view = np.ndarray(
+                probability_shape,
+                dtype=np.float16,
+                buffer=self._probability_shm.buf,
+            )
+            self._host_layer0_input_buffer_view = np.ndarray(
+                layer0_input_shape,
+                dtype=np.float16,
+                buffer=self._layer0_input_shm.buf,
             )
 
     def get_routed_experts(self, indices: np.ndarray) -> np.ndarray:
@@ -322,6 +524,46 @@ class RoutedExpertsReader:
         with _file_lock(self._lock_file, mode="rb+"):
             return self._host_buffer_view[indices, :, :].copy()
 
+    def get_routed_expert_probabilities(self, indices: np.ndarray) -> np.ndarray:
+        """
+        Read routed expert probability maps from shared memory.
+
+        Args:
+            indices: Array of indices to read.
+
+        Returns:
+            Copy of the expert routing probability maps for the given indices.
+        """
+        if self._host_probability_buffer_view is None:
+            raise RuntimeError(
+                "Probability buffer not attached. Call attach_buffer() first."
+            )
+        if self._lock_file is None:
+            raise RuntimeError("Lock file not initialized.")
+
+        with _file_lock(self._lock_file, mode="rb+"):
+            return self._host_probability_buffer_view[indices, :, :].copy()
+
+    def get_layer0_input_embeddings(self, indices: np.ndarray) -> np.ndarray:
+        """
+        Read layer-0 input embeddings from shared memory.
+
+        Args:
+            indices: Array of indices to read.
+
+        Returns:
+            Copy of the layer-0 input embeddings for the given indices.
+        """
+        if self._host_layer0_input_buffer_view is None:
+            raise RuntimeError(
+                "Layer-0 input buffer not attached. Call attach_buffer() first."
+            )
+        if self._lock_file is None:
+            raise RuntimeError("Lock file not initialized.")
+
+        with _file_lock(self._lock_file, mode="rb+"):
+            return self._host_layer0_input_buffer_view[indices, :].copy()
+
     def cleanup(self) -> None:
         """Explicitly clean up resources (close without unlink)."""
         if self._shm is not None:
@@ -331,6 +573,26 @@ class RoutedExpertsReader:
                 logger.debug("Exception during cleanup for reader", exc_info=True)
             finally:
                 self._shm = None
+        if self._probability_shm is not None:
+            try:
+                self._probability_shm.close()
+            except Exception:
+                logger.debug(
+                    "Exception during probability cleanup for reader",
+                    exc_info=True,
+                )
+            finally:
+                self._probability_shm = None
+        if self._layer0_input_shm is not None:
+            try:
+                self._layer0_input_shm.close()
+            except Exception:
+                logger.debug(
+                    "Exception during layer-0 input cleanup for reader",
+                    exc_info=True,
+                )
+            finally:
+                self._layer0_input_shm = None
 
     def __del__(self) -> None:
         """Close shared memory on destruction (do not unlink)."""
