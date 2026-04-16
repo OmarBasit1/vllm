@@ -5,10 +5,10 @@
   "endpoint_type": "chat",
   "public_dataset": "sharegpt",
   "streaming": true,
-  "concurrency": 10,
-  "request_rate": 5,
-  "request_count": 200,
+  "concurrency": 800,
+  "request_rate": 800,
+  "request_count": 24000,
   "arrival_pattern": "constant",
-  "working_dir": "/export2/obasit/ClusterMoE/vllm-MoE",
+  "working_dir": "../nebius_disag_launch_scripts",
   "extra_args": []
 }

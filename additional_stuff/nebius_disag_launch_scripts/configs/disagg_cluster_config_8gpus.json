@@ -1,7 +1,7 @@
 {
   "model": "Qwen/Qwen1.5-MoE-A2.7B-Chat",
   "working_dir": "../../../examples/others/lmcache/disagg_prefill_lmcache_v1",
-  "main_log_dir": "../../../../logs/qwen1.5_2.7B",
+  "main_log_dir": "../../../../logs/qwen1.5_2.7B/sharegpt_800bs",
   "proxy_script": "../disagg_proxy_pool.py",  
   "vllm_command": "vllm",
   "python_executable": "python3",
@@ -10,6 +10,7 @@
   "kv_transfer_backend": "nixl",
   "global_env": {
     "UCX_TLS": "cuda_ipc,cuda_copy,tcp",
+    "VLLM_USE_FLASHINFER_MOE_FP4": "0",
     "LMCACHE_USE_EXPERIMENTAL": "True",
     "VLLM_ENABLE_V1_MULTIPROCESSING": "1",
     "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
@@ -100,16 +101,16 @@
     "enforce_eager": true,
     "enable_prefix_caching": false,
     "enable_expert_parallel": true,
-    "max_num_seqs": 256,
-    "max_num_batched_tokens": 10000,
-    "chunk_size": 256,
+    "max_num_seqs": 1024,
+    "max_num_batched_tokens": 8192,
+    "chunk_size": 1024,
     "extra_vllm_args": [],
     "instance_overrides": [
       {
         "index": 0,
-        "max_num_seqs": 256,
+        "max_num_seqs": 1024,
         "max_num_batched_tokens": 8192,
-        "chunk_size": 256
+        "chunk_size": 1024
       }
     ]
   }
