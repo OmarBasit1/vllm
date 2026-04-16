@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import threading
+
 import torch
 
 from vllm.model_executor.layers.fused_moe.moe_profiler import MoEProfiler
@@ -59,3 +61,39 @@ def test_materialize_iteration_record_keeps_only_local_experts() -> None:
             ],
         }
     ]
+
+
+def test_rank_component_prefers_ep_when_enabled() -> None:
+    profiler = MoEProfiler.__new__(MoEProfiler)
+    profiler._state_lock = threading.Lock()
+    profiler._use_expert_parallel = True
+    profiler._expert_parallel_rank = 2
+    profiler._tensor_parallel_rank = 5
+
+    assert profiler._get_rank_component() == ("ep", 2)
+
+    profiler._use_expert_parallel = False
+    assert profiler._get_rank_component() == ("tp", 5)
+
+
+def test_update_parallel_ranks_tracks_ep_and_tp() -> None:
+    profiler = MoEProfiler.__new__(MoEProfiler)
+    profiler._state_lock = threading.Lock()
+    profiler._use_expert_parallel = False
+    profiler._tensor_parallel_rank = 3
+    profiler._expert_parallel_rank = None
+    profiler._expert_parallel_size = None
+
+    profiler.update_parallel_ranks(
+        tensor_parallel_rank=1,
+        expert_parallel_rank=7,
+        expert_parallel_size=8,
+        use_expert_parallel=True,
+    )
+    assert profiler._get_rank_component() == ("ep", 7)
+    assert profiler._expert_parallel_size == 8
+
+    profiler.update_parallel_ranks(use_expert_parallel=False)
+    assert profiler._get_rank_component() == ("tp", 1)
+    assert profiler._expert_parallel_rank is None
+    assert profiler._expert_parallel_size is None

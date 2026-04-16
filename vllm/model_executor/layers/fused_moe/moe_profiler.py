@@ -88,17 +88,41 @@ class MoEProfiler:
         self._writer.start()
 
         pc = vllm_config.parallel_config
-        self._metadata = {
-            "format_version": 1,
-            "log_type": "temporal_expert",
-            "instance_id": vllm_config.instance_id,
-            "model": vllm_config.model_config.model,
-            "tensor_parallel_rank": pc.rank,
-            "data_parallel_rank": pc.data_parallel_rank,
-            "pipeline_parallel_size": pc.pipeline_parallel_size,
-            "pid": os.getpid(),
-            "session_timestamp_utc": self._session_timestamp_utc,
-        }
+        self._instance_id = vllm_config.instance_id
+        self._model = vllm_config.model_config.model
+        self._global_rank = int(pc.rank)
+        # Fallback TP rank when model-level rank info is unavailable.
+        self._tensor_parallel_rank = int(pc.rank)
+        self._data_parallel_rank = int(pc.data_parallel_rank)
+        self._pipeline_parallel_size = int(pc.pipeline_parallel_size)
+        self._use_expert_parallel = bool(pc.enable_expert_parallel)
+        self._expert_parallel_rank: int | None = None
+        self._expert_parallel_size: int | None = None
+        self._pid = os.getpid()
+
+    def update_parallel_ranks(
+        self,
+        *,
+        tensor_parallel_rank: int | None = None,
+        expert_parallel_rank: int | None = None,
+        expert_parallel_size: int | None = None,
+        use_expert_parallel: bool | None = None,
+    ) -> None:
+        with self._state_lock:
+            if tensor_parallel_rank is not None:
+                self._tensor_parallel_rank = int(tensor_parallel_rank)
+            if use_expert_parallel is not None:
+                self._use_expert_parallel = bool(use_expert_parallel)
+
+            if expert_parallel_rank is not None:
+                self._expert_parallel_rank = int(expert_parallel_rank)
+            elif use_expert_parallel is False:
+                self._expert_parallel_rank = None
+
+            if expert_parallel_size is not None:
+                self._expert_parallel_size = int(expert_parallel_size)
+            elif use_expert_parallel is False:
+                self._expert_parallel_size = None
 
     def init_buffer(
         self,
@@ -399,12 +423,37 @@ class MoEProfiler:
             finally:
                 self._write_queue.task_done()
 
+    def _get_rank_component(self) -> tuple[str, int]:
+        with self._state_lock:
+            if self._use_expert_parallel and self._expert_parallel_rank is not None:
+                return "ep", self._expert_parallel_rank
+            return "tp", self._tensor_parallel_rank
+
+    def _build_metadata(self) -> dict[str, Any]:
+        with self._state_lock:
+            return {
+                "format_version": 1,
+                "log_type": "temporal_expert",
+                "instance_id": self._instance_id,
+                "model": self._model,
+                "global_rank": self._global_rank,
+                "tensor_parallel_rank": self._tensor_parallel_rank,
+                "expert_parallel_rank": self._expert_parallel_rank,
+                "expert_parallel_size": self._expert_parallel_size,
+                "use_expert_parallel": self._use_expert_parallel,
+                "data_parallel_rank": self._data_parallel_rank,
+                "pipeline_parallel_size": self._pipeline_parallel_size,
+                "pid": self._pid,
+                "session_timestamp_utc": self._session_timestamp_utc,
+            }
+
     def _get_chunk_paths(self, chunk_index: int) -> tuple[Path, Path]:
+        rank_kind, rank_value = self._get_rank_component()
         file_name = (
-            f"temporal_expert_profile_{self._metadata['instance_id']}_"
-            f"dp{self._metadata['data_parallel_rank']}_"
-            f"tp{self._metadata['tensor_parallel_rank']}_"
-            f"pid{self._metadata['pid']}_"
+            f"temporal_expert_profile_{self._instance_id}_"
+            f"dp{self._data_parallel_rank}_"
+            f"{rank_kind}{rank_value}_"
+            f"pid{self._pid}_"
             f"ts{self._session_timestamp_utc}_"
             f"chunk{chunk_index:06d}.msgpack.zlib"
         )
@@ -470,7 +519,7 @@ class MoEProfiler:
     ) -> None:
         target_path, temp_path = self._get_chunk_paths(chunk_index)
         payload = {
-            "metadata": self._metadata,
+            "metadata": self._build_metadata(),
             "iterations": [
                 self._materialize_iteration_record(record) for record in records
             ],

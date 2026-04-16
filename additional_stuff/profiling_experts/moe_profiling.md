@@ -48,8 +48,11 @@ When enabled, workers write temporal expert logs into
 Chunk file format:
 
 ```text
-temporal_expert_profile_<instance>_dp<dp_rank>_tp<tp_rank>_pid<pid>_ts<YYYYMMDDTHHMMSSZ>_chunk<index>.msgpack.zlib
+temporal_expert_profile_<instance>_dp<dp_rank>_<tp|ep><rank>_pid<pid>_ts<YYYYMMDDTHHMMSSZ>_chunk<index>.msgpack.zlib
 ```
+
+When expert parallelism is enabled, files are keyed by `ep<rank>` so each
+EP instance writes a distinct stream.
 
 Each chunk contains:
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
 import zlib
 from pathlib import Path
 from typing import Any
@@ -79,6 +80,15 @@ def _extract_session_timestamp(path: Path) -> str:
     return name[idx + len(marker) :].split("_chunk", maxsplit=1)[0]
 
 
+def _extract_rank_key(path: Path) -> str:
+    for token in path.name.split("_"):
+        if token.startswith("ep") and token[2:].isdigit():
+            return token
+        if token.startswith("tp") and token[2:].isdigit():
+            return token
+    return "tp0"
+
+
 def _decode_temporal_chunk(path: Path) -> dict[str, Any]:
     compressed = path.read_bytes()
     return msgspec.msgpack.decode(zlib.decompress(compressed))
@@ -98,27 +108,33 @@ def _layer_request_load(layer_record: dict[str, Any]) -> int:
     return layer_load
 
 
-def compute_instance_flattened_load(instance_dir: Path) -> list[int]:
+def compute_instance_flattened_load(instance_dir: Path) -> dict[str, list[int]]:
     temporal_dir = instance_dir / "temporal_expert_logs"
-    chunk_files = sorted(
-        temporal_dir.glob("*.msgpack.zlib"),
-        key=lambda p: (
-            _extract_session_timestamp(p),
-            _extract_chunk_index(p),
-            p.name,
-        ),
-    )
+    files_by_rank: dict[str, list[Path]] = defaultdict(list)
+    for chunk_file in temporal_dir.glob("*.msgpack.zlib"):
+        files_by_rank[_extract_rank_key(chunk_file)].append(chunk_file)
 
-    flattened_loads: list[int] = []
+    flattened_loads_by_rank: dict[str, list[int]] = {}
+    for rank_key in sorted(files_by_rank):
+        flattened_loads: list[int] = []
+        chunk_files = sorted(
+            files_by_rank[rank_key],
+            key=lambda p: (
+                _extract_session_timestamp(p),
+                _extract_chunk_index(p),
+                p.name,
+            ),
+        )
+        for chunk_file in chunk_files:
+            payload = _decode_temporal_chunk(chunk_file)
+            for iteration in payload.get("iterations", []):
+                layers = iteration.get("layers", [])
+                iteration_layer_loads = [_layer_request_load(layer) for layer in layers]
+                flattened_loads.extend(iteration_layer_loads)
+        if flattened_loads:
+            flattened_loads_by_rank[rank_key] = flattened_loads
 
-    for chunk_file in chunk_files:
-        payload = _decode_temporal_chunk(chunk_file)
-        for iteration in payload.get("iterations", []):
-            layers = iteration.get("layers", [])
-            iteration_layer_loads = [_layer_request_load(layer) for layer in layers]
-            flattened_loads.extend(iteration_layer_loads)
-
-    return flattened_loads
+    return flattened_loads_by_rank
 
 
 def plot_decode_temporal_load(
@@ -136,12 +152,17 @@ def plot_decode_temporal_load(
     any_data = False
 
     for instance_dir in decode_instances:
-        flattened_loads = compute_instance_flattened_load(instance_dir)
-        if not flattened_loads:
+        flattened_loads_by_rank = compute_instance_flattened_load(instance_dir)
+        if not flattened_loads_by_rank:
             continue
 
-        any_data = True
-        plt.plot(flattened_loads, linewidth=1.7, label=instance_dir.name)
+        for rank_key, flattened_loads in flattened_loads_by_rank.items():
+            any_data = True
+            plt.plot(
+                flattened_loads,
+                linewidth=1.7,
+                label=f"{instance_dir.name}:{rank_key}",
+            )
 
     if not any_data:
         raise RuntimeError("Temporal log files were found, but no iteration data was parsed.")

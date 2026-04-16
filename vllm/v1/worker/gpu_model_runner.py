@@ -6978,6 +6978,26 @@ class GPUModelRunner(
                             expert_probabilities,
                         )
                     if _profiler is not None:
+                        use_ep = bool(getattr(_module, "use_ep", False))
+                        tp_rank = getattr(_module, "tp_rank", None)
+                        ep_rank = getattr(_module, "ep_rank", None)
+                        ep_size = getattr(_module, "ep_size", None)
+                        _profiler.update_parallel_ranks(
+                            tensor_parallel_rank=(
+                                int(tp_rank) if tp_rank is not None else None
+                            ),
+                            expert_parallel_rank=(
+                                int(ep_rank)
+                                if use_ep and ep_rank is not None
+                                else None
+                            ),
+                            expert_parallel_size=(
+                                int(ep_size)
+                                if use_ep and ep_size is not None
+                                else None
+                            ),
+                            use_expert_parallel=use_ep,
+                        )
                         local_expert_map = getattr(_module, "_expert_map", None)
                         _profiler.log(
                             layer_id=_layer_id,
