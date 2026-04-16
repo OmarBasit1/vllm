@@ -100,6 +100,8 @@ Per role and per-instance fields:
 - `chunk_size` -> maps to `LMCACHE_CHUNK_SIZE`
 - `enable_prefix_caching` -> maps to `--enable-prefix-caching` / `--no-enable-prefix-caching`
 - `enable_expert_parallel` -> maps to `--enable-expert-parallel`
+- `nixl_side_channel_port_start` / `nixl_side_channel_port` -> per-instance `VLLM_NIXL_SIDE_CHANNEL_PORT` for NIXL handshake listener
+- `nixl_side_channel_host` -> per-instance `VLLM_NIXL_SIDE_CHANNEL_HOST`
 - `kv_transfer_backend` -> optional role/instance override for connector choice
 - `kv_connector_extra_config` -> merged into `kv_transfer_config.kv_connector_extra_config`
 - `kv_transfer_fields` -> extra top-level KV fields (e.g. `kv_load_failure_policy`)
@@ -115,6 +117,7 @@ KV backend notes:
 
 - `kv_transfer_backend=lmcache` (default): launcher uses LMCache-style kv transfer config and sets `LMCACHE_CONFIG_FILE`; `chunk_size` applies here.
 - `kv_transfer_backend=nixl`: launcher uses `NixlConnector` by default (unless you override `kv_connector`), and does not require LMCache config paths.
+- For `kv_transfer_backend=nixl`, launcher sets a unique side-channel port per instance by default (`10000 + serve_port`) to avoid ZMQ bind collisions on `tcp://localhost:5600`.
 - You can switch backend globally at top-level or override per role / per instance.
 - If you set `kv_connector` explicitly in role/instance config, that explicit connector overrides backend defaults.
 

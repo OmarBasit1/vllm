@@ -397,6 +397,8 @@ def build_instances_and_commands(
                 "port_step": 1,
                 "connect_host": "127.0.0.1",
                 "bind_host": "0.0.0.0",
+                "nixl_side_channel_host": None,
+                "nixl_side_channel_port_start": None,
                 "kv_transfer_backend": None,
                 "kv_connector": None,
                 "kv_role": "kv_producer",
@@ -421,6 +423,8 @@ def build_instances_and_commands(
                 "port_step": 1,
                 "connect_host": "127.0.0.1",
                 "bind_host": "0.0.0.0",
+                "nixl_side_channel_host": None,
+                "nixl_side_channel_port_start": None,
                 "kv_transfer_backend": None,
                 "kv_connector": None,
                 "kv_role": "kv_consumer",
@@ -605,6 +609,31 @@ def build_instances_and_commands(
                 env["LMCACHE_CONFIG_FILE"] = str(lmcache_config_file)
                 if chunk_size is not None:
                     env["LMCACHE_CHUNK_SIZE"] = str(chunk_size)
+            else:
+                nixl_side_channel_host = override.get(
+                    "nixl_side_channel_host",
+                    role_cfg.get("nixl_side_channel_host"),
+                )
+                if nixl_side_channel_host is not None:
+                    env["VLLM_NIXL_SIDE_CHANNEL_HOST"] = str(nixl_side_channel_host)
+
+                nixl_side_channel_port_raw = override.get("nixl_side_channel_port")
+                if nixl_side_channel_port_raw is None:
+                    port_start_raw = role_cfg.get("nixl_side_channel_port_start")
+                    if port_start_raw is not None:
+                        nixl_side_channel_port_raw = int(port_start_raw) + idx
+
+                # Default to a deterministic per-instance port derived from serve port.
+                if nixl_side_channel_port_raw is None:
+                    nixl_side_channel_port_raw = 10000 + port
+
+                nixl_side_channel_port = int(nixl_side_channel_port_raw)
+                if nixl_side_channel_port <= 0 or nixl_side_channel_port > 65535:
+                    raise ValueError(
+                        f"{role_name}[{idx}] nixl_side_channel_port must be in range 1..65535, "
+                        f"got {nixl_side_channel_port}"
+                    )
+                env["VLLM_NIXL_SIDE_CHANNEL_PORT"] = str(nixl_side_channel_port)
 
             cmd = _build_instance_cmd(
                 vllm_command=str(cfg.get("vllm_command", "vllm")),
