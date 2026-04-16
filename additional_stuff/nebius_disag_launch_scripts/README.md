@@ -86,6 +86,7 @@ Top-level keys in `disagg_cluster_config.example.json`:
 - `decode.count`: Number of decode instances (`n2`).
 - `prefill.tp_size`, `decode.tp_size`: Default TP degree per role.
 - `prefill.enable_prefix_caching`, `decode.enable_prefix_caching`: Prefix-caching toggle per role (default `false`).
+- `prefill.enable_expert_parallel`, `decode.enable_expert_parallel`: Enable vLLM expert parallel mode for that role (default `false`).
 - `prefill.gpu_groups`, `decode.gpu_groups`: Explicit GPU groups per instance.
 - `prefill.instance_overrides`, `decode.instance_overrides`: Per-instance overrides.
 - `moe_profiling.enabled`: Global MoE profiling toggle.
@@ -98,6 +99,7 @@ Per role and per-instance fields:
 - `max_num_batched_tokens` -> maps to `--max-num-batched-tokens`
 - `chunk_size` -> maps to `LMCACHE_CHUNK_SIZE`
 - `enable_prefix_caching` -> maps to `--enable-prefix-caching` / `--no-enable-prefix-caching`
+- `enable_expert_parallel` -> maps to `--enable-expert-parallel`
 - `kv_transfer_backend` -> optional role/instance override for connector choice
 - `kv_connector_extra_config` -> merged into `kv_transfer_config.kv_connector_extra_config`
 - `kv_transfer_fields` -> extra top-level KV fields (e.g. `kv_load_failure_policy`)

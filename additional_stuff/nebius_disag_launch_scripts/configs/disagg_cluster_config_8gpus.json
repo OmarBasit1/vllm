@@ -82,9 +82,9 @@
     ]
   },
   "decode": {
-    "count": 4,
-    "tp_size": 1,
-    "gpu_groups": [[4], [5], [6], [7]],
+    "count": 1,
+    "tp_size": 4,
+    "gpu_groups": [[4, 5, 6, 7]],
     "bind_host": "0.0.0.0",
     "connect_host": "127.0.0.1",
     "port_start": 8200,
@@ -97,6 +97,7 @@
     "discard_partial_chunks": false,
     "enforce_eager": true,
     "enable_prefix_caching": false,
+    "enable_expert_parallel": true,
     "max_num_seqs": 256,
     "max_num_batched_tokens": 10000,
     "chunk_size": 256,
@@ -107,24 +108,6 @@
         "max_num_seqs": 256,
         "max_num_batched_tokens": 8192,
         "chunk_size": 256
-      },
-      {
-        "index": 1,
-        "max_num_seqs": 320,
-        "max_num_batched_tokens": 12000,
-        "chunk_size": 320
-      },
-      {
-        "index": 2,
-        "max_num_seqs": 256,
-        "max_num_batched_tokens": 10000,
-        "chunk_size": 256
-      },
-      {
-        "index": 3,
-        "max_num_seqs": 320,
-        "max_num_batched_tokens": 12000,
-        "chunk_size": 320
       }
     ]
   }

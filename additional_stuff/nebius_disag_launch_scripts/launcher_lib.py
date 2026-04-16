@@ -292,6 +292,7 @@ def _build_instance_cmd(
     max_num_seqs: Optional[int],
     max_num_batched_tokens: Optional[int],
     enable_prefix_caching: bool,
+    enable_expert_parallel: bool,
     kv_transfer_cfg: Dict[str, Any],
     enable_moe_profiling: bool,
     moe_log_dir: Optional[Path],
@@ -324,6 +325,9 @@ def _build_instance_cmd(
         cmd.append("--enable-prefix-caching")
     else:
         cmd.append("--no-enable-prefix-caching")
+
+    if enable_expert_parallel:
+        cmd.append("--enable-expert-parallel")
 
     if enable_moe_profiling:
         if moe_log_dir is None:
@@ -403,6 +407,7 @@ def build_instances_and_commands(
                 "lmcache_config_file": "./configs/lmcache-prefiller-config.yaml",
                 "enforce_eager": True,
                 "enable_prefix_caching": False,
+                "enable_expert_parallel": False,
                 "max_num_seqs": None,
                 "max_num_batched_tokens": None,
                 "chunk_size": None,
@@ -426,6 +431,7 @@ def build_instances_and_commands(
                 "lmcache_config_file": "./configs/lmcache-decoder-config.yaml",
                 "enforce_eager": True,
                 "enable_prefix_caching": False,
+                "enable_expert_parallel": False,
                 "max_num_seqs": None,
                 "max_num_batched_tokens": None,
                 "chunk_size": None,
@@ -510,6 +516,12 @@ def build_instances_and_commands(
                 override.get(
                     "enable_prefix_caching",
                     role_cfg.get("enable_prefix_caching", False),
+                )
+            )
+            enable_expert_parallel = bool(
+                override.get(
+                    "enable_expert_parallel",
+                    role_cfg.get("enable_expert_parallel", False),
                 )
             )
 
@@ -603,6 +615,7 @@ def build_instances_and_commands(
                 max_num_seqs=max_num_seqs,
                 max_num_batched_tokens=max_num_batched_tokens,
                 enable_prefix_caching=enable_prefix_caching,
+                enable_expert_parallel=enable_expert_parallel,
                 kv_transfer_cfg=kv_transfer_cfg,
                 enable_moe_profiling=enable_moe_profiling,
                 moe_log_dir=moe_log_dir,
