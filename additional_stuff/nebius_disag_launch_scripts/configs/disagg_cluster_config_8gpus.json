@@ -1,6 +1,6 @@
 {
   "model": "Qwen/Qwen1.5-MoE-A2.7B-Chat",
-  "working_dir": "/export2/obasit/ClusterMoE/vllm-MoE/examples/others/lmcache/disagg_prefill_lmcache_v1",
+  "working_dir": "../../../examples/others/lmcache/disagg_prefill_lmcache_v1",
   "main_log_dir": "../../../../logs/qwen1.5_2.7B",
   "proxy_script": "../disagg_proxy_pool.py",  
   "vllm_command": "vllm",
