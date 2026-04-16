@@ -20,11 +20,11 @@
     "health_check_interval_sec": 2
   },
   "moe_profiling": {
-    "enabled": true,
+    "enabled": false,
     "subdir": "moe_profiles"
   },
   "temporal_expert_logging": {
-    "enabled": false,
+    "enabled": true,
     "subdir": "temporal_expert_logs"
   },
   "proxy": {
