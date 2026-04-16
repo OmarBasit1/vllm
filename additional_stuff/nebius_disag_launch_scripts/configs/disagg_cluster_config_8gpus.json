@@ -7,7 +7,7 @@
   "python_executable": "python3",
   "run_id": "qwen_disagg_example_8gpu",
   "gpu_pool": [0, 1, 2, 3, 4, 5, 6, 7],
-  "kv_transfer_backend": "lmcache",
+  "kv_transfer_backend": "nixl",
   "global_env": {
     "UCX_TLS": "cuda_ipc,cuda_copy,tcp",
     "LMCACHE_USE_EXPERIMENTAL": "True",
