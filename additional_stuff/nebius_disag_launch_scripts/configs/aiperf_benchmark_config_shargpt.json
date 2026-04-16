@@ -1,0 +1,14 @@
+{
+  "aiperf_binary": "aiperf",
+  "model": "Qwen/Qwen1.5-MoE-A2.7B-Chat",
+  "url": "http://127.0.0.1:9000",
+  "endpoint_type": "chat",
+  "public_dataset": "sharegpt",
+  "streaming": true,
+  "concurrency": 10,
+  "request_rate": 5,
+  "request_count": 200,
+  "arrival_pattern": "constant",
+  "working_dir": "/export2/obasit/ClusterMoE/vllm-MoE",
+  "extra_args": []
+}

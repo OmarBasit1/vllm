@@ -50,9 +50,10 @@ def build_cmd(cfg: Dict[str, Any]) -> List[str]:
         ("concurrency", "--concurrency"),
         ("request_rate", "--request-rate"),
         ("arrival_pattern", "--arrival-pattern"),
-        ("num_requests", "--num-requests"),
+        ("request_count", "--request-count"),
         ("max_concurrency", "--max-concurrency"),
         ("api_key", "--api-key"),
+        ("public_dataset", "--public-dataset"),
     ]
     for key, flag in optional_flags:
         value = cfg.get(key)
