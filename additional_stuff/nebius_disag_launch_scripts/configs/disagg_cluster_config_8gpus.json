@@ -1,0 +1,131 @@
+{
+  "model": "Qwen/Qwen1.5-MoE-A2.7B-Chat",
+  "working_dir": "/export2/obasit/ClusterMoE/vllm-MoE/examples/others/lmcache/disagg_prefill_lmcache_v1",
+  "main_log_dir": "../../../../logs/qwen1.5_2.7B",
+  "proxy_script": "../disagg_proxy_pool.py",  
+  "vllm_command": "vllm",
+  "python_executable": "python3",
+  "run_id": "qwen_disagg_example_8gpu",
+  "gpu_pool": [0, 1, 2, 3, 4, 5, 6, 7],
+  "kv_transfer_backend": "lmcache",
+  "global_env": {
+    "UCX_TLS": "cuda_ipc,cuda_copy,tcp",
+    "LMCACHE_USE_EXPERIMENTAL": "True",
+    "VLLM_ENABLE_V1_MULTIPROCESSING": "1",
+    "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+    "PYTHONHASHSEED": "123"
+  },
+  "launcher": {
+    "health_check_timeout_sec": 1200,
+    "health_check_interval_sec": 2
+  },
+  "moe_profiling": {
+    "enabled": true,
+    "subdir": "moe_profiles"
+  },
+  "temporal_expert_logging": {
+    "enabled": false,
+    "subdir": "temporal_expert_logs"
+  },
+  "proxy": {
+    "host": "127.0.0.1",
+    "connect_host": "127.0.0.1",
+    "port": 9000,
+    "request_timeout_sec": 600
+  },
+  "common_vllm_args": [],
+  "prefill": {
+    "count": 4,
+    "tp_size": 1,
+    "gpu_groups": [[0], [1], [2], [3]],
+    "bind_host": "0.0.0.0",
+    "connect_host": "127.0.0.1",
+    "port_start": 8100,
+    "port_step": 1,
+    "lmcache_config_file": "./configs/lmcache-prefiller-config.yaml",
+    "kv_role": "kv_producer",
+    "kv_connector_extra_config": {},
+    "kv_transfer_fields": {},
+    "rpc_port_prefix": "producer",
+    "discard_partial_chunks": false,
+    "enforce_eager": true,
+    "enable_prefix_caching": false,
+    "max_num_seqs": 256,
+    "max_num_batched_tokens": 10000,
+    "chunk_size": 256,
+    "extra_vllm_args": [],
+    "instance_overrides": [
+      {
+        "index": 0,
+        "max_num_seqs": 192,
+        "max_num_batched_tokens": 8192,
+        "chunk_size": 192
+      },
+      {
+        "index": 1,
+        "max_num_seqs": 256,
+        "max_num_batched_tokens": 10000,
+        "chunk_size": 256
+      },
+      {
+        "index": 2,
+        "max_num_seqs": 256,
+        "max_num_batched_tokens": 10000,
+        "chunk_size": 256
+      },
+      {
+        "index": 3,
+        "max_num_seqs": 320,
+        "max_num_batched_tokens": 12000,
+        "chunk_size": 320
+      }
+    ]
+  },
+  "decode": {
+    "count": 4,
+    "tp_size": 1,
+    "gpu_groups": [[4], [5], [6], [7]],
+    "bind_host": "0.0.0.0",
+    "connect_host": "127.0.0.1",
+    "port_start": 8200,
+    "port_step": 1,
+    "lmcache_config_file": "./configs/lmcache-decoder-config.yaml",
+    "kv_role": "kv_consumer",
+    "kv_connector_extra_config": {},
+    "kv_transfer_fields": {},
+    "rpc_port_prefix": "consumer",
+    "discard_partial_chunks": false,
+    "enforce_eager": true,
+    "enable_prefix_caching": false,
+    "max_num_seqs": 256,
+    "max_num_batched_tokens": 10000,
+    "chunk_size": 256,
+    "extra_vllm_args": [],
+    "instance_overrides": [
+      {
+        "index": 0,
+        "max_num_seqs": 256,
+        "max_num_batched_tokens": 8192,
+        "chunk_size": 256
+      },
+      {
+        "index": 1,
+        "max_num_seqs": 320,
+        "max_num_batched_tokens": 12000,
+        "chunk_size": 320
+      },
+      {
+        "index": 2,
+        "max_num_seqs": 256,
+        "max_num_batched_tokens": 10000,
+        "chunk_size": 256
+      },
+      {
+        "index": 3,
+        "max_num_seqs": 320,
+        "max_num_batched_tokens": 12000,
+        "chunk_size": 320
+      }
+    ]
+  }
+}

@@ -185,6 +185,11 @@ class LLM:
         enable_moe_profiling: Whether to enable lightweight MoE profiling
             that logs routed experts per layer and iteration to disk.
         moe_profiling_log_dir: Directory where MoE profiling files are written.
+        enable_temporal_expert_logging: Whether to enable temporal MoE expert
+            logging that stores per-iteration, per-layer routed top-k experts
+            grouped by request position in the active batch.
+        temporal_expert_log_dir: Directory where temporal expert logging files
+            are written.
         disable_custom_all_reduce: See
             [ParallelConfig][vllm.config.ParallelConfig].
         hf_token: The token to use as HTTP bearer authorization for remote files
@@ -243,6 +248,8 @@ class LLM:
         enable_return_routed_experts: bool = False,
         enable_moe_profiling: bool = False,
         moe_profiling_log_dir: str = "./vllm_moe_profiles",
+        enable_temporal_expert_logging: bool = False,
+        temporal_expert_log_dir: str = "./vllm_temporal_expert_logs",
         disable_custom_all_reduce: bool = False,
         hf_token: bool | str | None = None,
         hf_overrides: HfOverrides | None = None,
@@ -371,6 +378,8 @@ class LLM:
             enable_return_routed_experts=enable_return_routed_experts,
             enable_moe_profiling=enable_moe_profiling,
             moe_profiling_log_dir=moe_profiling_log_dir,
+            enable_temporal_expert_logging=enable_temporal_expert_logging,
+            temporal_expert_log_dir=temporal_expert_log_dir,
             disable_custom_all_reduce=disable_custom_all_reduce,
             hf_token=hf_token,
             hf_overrides=hf_overrides,

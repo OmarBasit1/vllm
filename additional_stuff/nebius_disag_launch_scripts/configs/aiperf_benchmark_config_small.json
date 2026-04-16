@@ -1,0 +1,16 @@
+{
+  "aiperf_binary": "aiperf",
+  "model": "Qwen/Qwen1.5-MoE-A2.7B-Chat",
+  "url": "http://127.0.0.1:9000",
+  "endpoint_type": "chat",
+  "streaming": true,
+  "concurrency": 10,
+  "request_rate": 5,
+  "arrival_pattern": "constant",
+  "num_requests": 200,
+  "prompt_input_tokens_mean": 64,
+  "prompt_output_tokens_mean": 32,
+  "output_artifact_dir": "../../../../logs/qwen1.5_2.7B/aiperf_small",
+  "working_dir": "/export2/obasit/ClusterMoE/vllm-MoE",
+  "extra_args": []
+}

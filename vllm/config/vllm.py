@@ -1761,6 +1761,9 @@ class VllmConfig:
         if self.observability_config.enable_moe_profiling:
             unsupported.append("MoE profiling")
 
+        if self.observability_config.enable_temporal_expert_logging:
+            unsupported.append("temporal expert logging")
+
         if self.model_config is not None and self.model_config.logits_processors:
             unsupported.append("custom logits processors")
 

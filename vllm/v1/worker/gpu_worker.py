@@ -535,8 +535,34 @@ class Worker(WorkerBase):
         else:
             self.model_runner.initialize_kv_cache(kv_cache_config)
 
-        if self.model_config.enable_return_routed_experts:
+        if self.model_config.enable_return_routed_experts or (
+            self.vllm_config.observability_config.enable_moe_profiling
+            and self.model_config.is_moe
+        ):
             self.model_runner.init_routed_experts_capturer()
+
+        if self.vllm_config.observability_config.enable_temporal_expert_logging:
+            self.model_runner.init_moe_profiler()
+
+        if (
+            self.vllm_config.observability_config.enable_moe_profiling
+            and not self.model_config.is_moe
+        ):
+            logger.warning(
+                "enable_moe_profiling is set, but model '%s' is not an MoE "
+                "model. Ignoring MoE profiling.",
+                self.model_config.model,
+            )
+
+        if (
+            self.vllm_config.observability_config.enable_temporal_expert_logging
+            and not self.model_config.is_moe
+        ):
+            logger.warning(
+                "enable_temporal_expert_logging is set, but model '%s' is not "
+                "an MoE model. Ignoring temporal expert logging.",
+                self.model_config.model,
+            )
 
         # Build KV-zero metadata outside the CuMem pool so the bookkeeping
         # GPU tensors (seg_addrs, block-id buffers) use the standard PyTorch
@@ -1004,6 +1030,8 @@ class Worker(WorkerBase):
         # has_kv_transfer_group can be None during interpreter shutdown.
         if ensure_kv_transfer_shutdown is not None:
             ensure_kv_transfer_shutdown()
+        if self.model_runner is not None:
+            self.model_runner.shutdown()
         if self.profiler is not None:
             self.profiler.shutdown()
 

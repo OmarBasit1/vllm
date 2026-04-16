@@ -3840,9 +3840,6 @@ class GPUModelRunner(
                     return EMPTY_MODEL_RUNNER_OUTPUT
                 return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
 
-            if self.moe_profiling_initialized and self.moe_profiler is not None:
-                self.moe_profiler.start_iteration()
-
             if self.cache_config.kv_sharing_fast_prefill:
                 assert not self.num_prompt_logprobs, (
                     "--kv-sharing-fast-prefill produces incorrect "
@@ -3853,6 +3850,8 @@ class GPUModelRunner(
             num_reqs = self.input_batch.num_reqs
             req_ids = self.input_batch.req_ids
             tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
+            if self.moe_profiling_initialized and self.moe_profiler is not None:
+                self.moe_profiler.start_iteration(request_token_counts=tokens)
             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
@@ -6920,14 +6919,28 @@ class GPUModelRunner(
         self.routed_experts_initialized = True
 
     def init_moe_profiler(self) -> None:
-        # Legacy chunk-based profiler is intentionally disabled.
-        # --enable-moe-profiling now only emits per-request JSONL logs.
-        logger.info(
-            "Legacy MoE chunk profiling is disabled; using request-level "
-            "moe_request_profile JSONL output only."
-        )
         self.moe_profiler = None
         self.moe_profiling_initialized = False
+
+        if not self.observability_config.enable_temporal_expert_logging:
+            return
+
+        if not self.model_config.is_moe:
+            return
+
+        self.moe_profiler = MoEProfiler(
+            log_dir=self.observability_config.temporal_expert_log_dir,
+            vllm_config=self.vllm_config,
+        )
+        self.moe_profiler.init_buffer(
+            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens
+        )
+        self.moe_profiling_initialized = True
+        self._bind_moe_capture_hooks()
+        logger.info(
+            "Temporal expert logging enabled; writing chunked logs to %s",
+            self.observability_config.temporal_expert_log_dir,
+        )
 
     def _bind_moe_capture_hooks(self) -> None:
         from vllm.model_executor.layers.fused_moe.layer import FusedMoE
@@ -6952,6 +6965,7 @@ class GPUModelRunner(
                     hidden_states: torch.Tensor,
                     expert_probabilities: torch.Tensor | None,
                     _layer_id=layer_id,
+                    _module=module,
                     _capturer=capturer,
                     _profiler=profiler,
                 ):
@@ -6964,10 +6978,11 @@ class GPUModelRunner(
                             expert_probabilities,
                         )
                     if _profiler is not None:
+                        local_expert_map = getattr(_module, "_expert_map", None)
                         _profiler.log(
                             layer_id=_layer_id,
                             expert_ids=topk_ids,
-                            routing_weights=topk_weights,
+                            local_expert_map=local_expert_map,
                         )
 
                 module.router.set_capture_fn(_capture_fn)

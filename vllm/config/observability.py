@@ -87,6 +87,17 @@ class ObservabilityConfig:
     moe_profiling_log_dir: str = "./vllm_moe_profiles"
     """Directory used by workers to store MoE profiling logs."""
 
+    enable_temporal_expert_logging: bool = False
+    """Enable temporal MoE expert logging.
+
+    When enabled, workers capture top-k routed experts per layer for each
+    scheduled request position in every iteration and write periodic chunked
+    logs to disk asynchronously.
+    """
+
+    temporal_expert_log_dir: str = "./vllm_temporal_expert_logs"
+    """Directory used by workers to store temporal expert logs."""
+
     @cached_property
     def collect_model_forward_time(self) -> bool:
         """Whether to collect model forward time for the request."""
@@ -160,6 +171,14 @@ class ObservabilityConfig:
         value = value.strip()
         if not value:
             raise ValueError("moe_profiling_log_dir must not be empty.")
+        return value
+
+    @field_validator("temporal_expert_log_dir")
+    @classmethod
+    def _validate_temporal_expert_log_dir(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("temporal_expert_log_dir must not be empty.")
         return value
 
     @model_validator(mode="after")

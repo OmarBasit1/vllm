@@ -109,3 +109,22 @@ def test_moe_profiling_args_from_cli(tmp_path):
     engine_args = EngineArgs.from_cli_args(args=args)
     assert engine_args.enable_moe_profiling
     assert engine_args.moe_profiling_log_dir == str(tmp_path)
+
+
+def test_temporal_expert_logging_args_from_cli(tmp_path):
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+
+    args = parser.parse_args([])
+    engine_args = EngineArgs.from_cli_args(args=args)
+    assert not engine_args.enable_temporal_expert_logging
+
+    args = parser.parse_args(
+        [
+            "--enable-temporal-expert-logging",
+            "--temporal-expert-log-dir",
+            str(tmp_path),
+        ]
+    )
+    engine_args = EngineArgs.from_cli_args(args=args)
+    assert engine_args.enable_temporal_expert_logging
+    assert engine_args.temporal_expert_log_dir == str(tmp_path)

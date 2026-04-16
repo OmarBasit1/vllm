@@ -36,6 +36,35 @@ Each JSONL line is one finished request with:
     - For each layer/token, taking top-k along the expert axis reproduces the
       selected `expert_ids` in standard top-k routing modes
 
+## What `--enable-temporal-expert-logging` writes
+
+When enabled, workers write temporal expert logs into
+`--temporal-expert-log-dir` (default: `./vllm_temporal_expert_logs`).
+
+- Iteration-level snapshots of top-k routed experts (k comes from model config)
+- Grouped by request position within that iteration's active batch
+- No request IDs or prompt/output payload are stored
+
+Chunk file format:
+
+```text
+temporal_expert_profile_<instance>_dp<dp_rank>_tp<tp_rank>_pid<pid>_ts<YYYYMMDDTHHMMSSZ>_chunk<index>.msgpack.zlib
+```
+
+Each chunk contains:
+
+- `iteration_no`
+- `token_count`
+- `request_token_counts` (token count for each request-position in batch order)
+- `layers`
+  - `layer_no`
+  - `request_expert_ids` shaped `[num_requests, tokens_for_request, <=top_k]`
+    (global expert IDs are retained, and experts non-local to the current
+    serving instance are dropped)
+
+Writes are buffered and flushed periodically as compressed chunks using a
+background writer thread to reduce impact on inference latency and memory.
+
 ## Enable MoE profiling
 
 ### Serve + benchmark example (`vllm bench serve`)
@@ -47,7 +76,9 @@ vllm serve Qwen/Qwen1.5-MoE-A2.7B-Chat \
   --host 0.0.0.0 \
   --port 9000 \
   --enable-moe-profiling \
-  --moe-profiling-log-dir ./moe_logs
+  --moe-profiling-log-dir ./moe_logs \
+  --enable-temporal-expert-logging \
+  --temporal-expert-log-dir ./temporal_expert_logs
 ```
 
 2. In another terminal, run online serving benchmark traffic:

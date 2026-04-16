@@ -570,6 +570,10 @@ class EngineArgs:
     )
     enable_moe_profiling: bool = ObservabilityConfig.enable_moe_profiling
     moe_profiling_log_dir: str = ObservabilityConfig.moe_profiling_log_dir
+    enable_temporal_expert_logging: bool = (
+        ObservabilityConfig.enable_temporal_expert_logging
+    )
+    temporal_expert_log_dir: str = ObservabilityConfig.temporal_expert_log_dir
     enable_mm_processor_stats: bool = ObservabilityConfig.enable_mm_processor_stats
     scheduling_policy: SchedulerPolicy = SchedulerConfig.policy
     scheduler_cls: str | type[object] | None = SchedulerConfig.scheduler_cls
@@ -1229,6 +1233,14 @@ class EngineArgs:
         observability_group.add_argument(
             "--moe-profiling-log-dir",
             **observability_kwargs["moe_profiling_log_dir"],
+        )
+        observability_group.add_argument(
+            "--enable-temporal-expert-logging",
+            **observability_kwargs["enable_temporal_expert_logging"],
+        )
+        observability_group.add_argument(
+            "--temporal-expert-log-dir",
+            **observability_kwargs["temporal_expert_log_dir"],
         )
 
         # Scheduler arguments
@@ -1981,6 +1993,8 @@ class EngineArgs:
             enable_logging_iteration_details=self.enable_logging_iteration_details,
             enable_moe_profiling=self.enable_moe_profiling,
             moe_profiling_log_dir=self.moe_profiling_log_dir,
+            enable_temporal_expert_logging=self.enable_temporal_expert_logging,
+            temporal_expert_log_dir=self.temporal_expert_log_dir,
         )
 
         # Compilation config overrides
