@@ -654,6 +654,7 @@ def build_instances_and_commands(
                 extra_role_args=[str(x) for x in role_cfg.get("extra_vllm_args", [])],
                 extra_instance_args=[str(x) for x in override.get("extra_vllm_args", [])],
             )
+            print(f"Built command for {role_name}[{idx}]: {' '.join(cmd)}")
 
             all_instances.append(
                 {
