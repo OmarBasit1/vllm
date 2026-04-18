@@ -55,6 +55,10 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 from vllm.v1.utils import compute_iteration_details, report_usage_stats
+from vllm.v1.worker.iter_profile_logger import (
+    IterProfileHandle,
+    IterProfileLogger,
+)
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.worker_base import WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
@@ -153,6 +157,8 @@ class Worker(WorkerBase):
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
+        self.iter_profile_logger: IterProfileLogger | None = None
+        self._iter_profile_inflight: IterProfileHandle | None = None
 
     def sleep(self, level: int = 1) -> None:
         from vllm.device_allocator.cumem import CuMemAllocator
@@ -308,6 +314,19 @@ class Worker(WorkerBase):
             )
 
             self.model_runner = GPUModelRunnerV1(self.vllm_config, self.device)
+
+        if self.scheduler_config.iter_profile:
+            try:
+                self.iter_profile_logger = IterProfileLogger.from_vllm_config(
+                    self.vllm_config,
+                    global_rank=self.rank,
+                    local_rank=self.local_rank,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to initialize iter profile logger; disabling iter_profile."
+                )
+                self.iter_profile_logger = None
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
@@ -742,7 +761,46 @@ class Worker(WorkerBase):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self.model_runner.sample_tokens(grammar_output)
+        self._poll_iter_profile()
+        output = self.model_runner.sample_tokens(grammar_output)
+        self._finish_iter_profile_iteration()
+        return output
+
+    def _poll_iter_profile(self) -> None:
+        if self.iter_profile_logger is None:
+            return
+        self.iter_profile_logger.poll_ready_iterations()
+
+    def _start_iter_profile_iteration(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> None:
+        if self.iter_profile_logger is None:
+            return
+        if self._iter_profile_inflight is not None:
+            logger.warning(
+                "Detected unfinished iter_profile handle from a previous "
+                "iteration; finalizing it before starting a new one."
+            )
+            self._finish_iter_profile_iteration()
+        if scheduler_output.total_num_scheduled_tokens <= 0:
+            self._poll_iter_profile()
+            return
+
+        self._poll_iter_profile()
+        self._iter_profile_inflight = self.iter_profile_logger.start_iteration(
+            batch_size=len(scheduler_output.num_scheduled_tokens),
+            num_scheduled_tokens=scheduler_output.total_num_scheduled_tokens,
+        )
+
+    def _finish_iter_profile_iteration(self) -> None:
+        if self.iter_profile_logger is None:
+            return
+        if self._iter_profile_inflight is None:
+            self._poll_iter_profile()
+            return
+
+        self.iter_profile_logger.finish_iteration(self._iter_profile_inflight)
+        self._iter_profile_inflight = None
 
     @torch.inference_mode()
     def execute_model(
@@ -760,6 +818,8 @@ class Worker(WorkerBase):
         all_gather_tensors = {}
         compilation_config = self.vllm_config.compilation_config
         parallel_config = self.vllm_config.parallel_config
+
+        self._start_iter_profile_iteration(scheduler_output)
 
         if (
             parallel_config.pipeline_parallel_size > 1
@@ -817,6 +877,10 @@ class Worker(WorkerBase):
             if isinstance(
                 output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
             ):
+                if output is None:
+                    self._poll_iter_profile()
+                else:
+                    self._finish_iter_profile_iteration()
                 return output
 
         assert isinstance(output, IntermediateTensors)
@@ -832,6 +896,8 @@ class Worker(WorkerBase):
             all_gather_group=get_tp_group(),
             all_gather_tensors=all_gather_tensors,
         )
+
+        self._finish_iter_profile_iteration()
 
         return None
 
@@ -1004,6 +1070,17 @@ class Worker(WorkerBase):
         # has_kv_transfer_group can be None during interpreter shutdown.
         if ensure_kv_transfer_shutdown is not None:
             ensure_kv_transfer_shutdown()
+
+        if self.iter_profile_logger is not None:
+            if self._iter_profile_inflight is not None:
+                logger.warning(
+                    "Dropping an unfinished iter_profile handle during shutdown."
+                )
+                self._iter_profile_inflight = None
+            self.iter_profile_logger.close()
+            self.iter_profile_logger = None
+            self._iter_profile_inflight = None
+
         if self.profiler is not None:
             self.profiler.shutdown()
 

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Callable
 from dataclasses import InitVar
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
@@ -147,6 +148,23 @@ class SchedulerConfig:
     avoid gaps in GPU utilization, leading to better latency and throughput.
     """
 
+    iter_profile: bool = False
+    """Enable per-iteration latency profiling for MoE execution.
+
+    This profiler records one JSONL row per engine iteration and logs:
+
+    - `batch_size`: Number of requests in the scheduled iteration.
+    - `latency_ms`: Iteration latency measured with CUDA events.
+
+    The profiler writes logs asynchronously through a separate process.
+    """
+
+    iter_profile_dir: str = ""
+    """Directory where iter-profile JSONL files are written.
+
+    If empty, a runtime default directory is chosen by the worker.
+    """
+
     stream_interval: int = Field(default=1, ge=1)
     """The interval (or buffer size) for streaming in terms of token length.
     A smaller value (1) makes streaming smoother by sending each token immediately,
@@ -221,6 +239,11 @@ class SchedulerConfig:
         return None if value is None else handler(value)
 
     def __post_init__(self, max_model_len: int, is_encoder_decoder: bool) -> None:
+        if self.iter_profile_dir:
+            self.iter_profile_dir = os.path.abspath(
+                os.path.expanduser(self.iter_profile_dir)
+            )
+
         if is_encoder_decoder:
             # Chunked prefill should be disabled for encoder-decoder models.
             self.disable_chunked_mm_input = True

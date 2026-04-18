@@ -1,0 +1,14 @@
+{
+  "aiperf_binary": "aiperf",
+  "model": "Qwen/Qwen1.5-MoE-A2.7B-Chat",
+  "url": "http://127.0.0.1:9000",
+  "endpoint_type": "chat",
+  "input_file": "../profiling_experts/mooncake_trace_4800.jsonl",
+  "custom_dataset_type": "mooncake_trace",
+  "streaming": true,
+  "concurrency": 80,
+  "request_rate": 10,
+  "arrival_pattern": "constant",
+  "working_dir": "../nebius_disag_launch_scripts",
+  "extra_args": []
+}

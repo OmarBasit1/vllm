@@ -220,6 +220,20 @@ def test_media_io_kwargs_parser(arg, expected):
     assert args.media_io_kwargs == expected
 
 
+def test_iter_profile_parser():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+
+    args = parser.parse_args([])
+    assert args.iter_profile is False
+    assert args.iter_profile_dir == ""
+
+    args = parser.parse_args(
+        ["--iter-profile", "--iter-profile-dir", "/tmp/vllm-iter-profile"]
+    )
+    assert args.iter_profile is True
+    assert args.iter_profile_dir == "/tmp/vllm-iter-profile"
+
+
 @pytest.mark.parametrize(
     ("args", "expected"),
     [

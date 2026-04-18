@@ -624,6 +624,9 @@ class EngineArgs:
 
     async_scheduling: bool | None = SchedulerConfig.async_scheduling
 
+    iter_profile: bool = SchedulerConfig.iter_profile
+    iter_profile_dir: str = SchedulerConfig.iter_profile_dir
+
     stream_interval: int = SchedulerConfig.stream_interval
 
     kv_sharing_fast_prefill: bool = CacheConfig.kv_sharing_fast_prefill
@@ -1282,6 +1285,12 @@ class EngineArgs:
             "--async-scheduling", **scheduler_kwargs["async_scheduling"]
         )
         scheduler_group.add_argument(
+            "--iter-profile", **scheduler_kwargs["iter_profile"]
+        )
+        scheduler_group.add_argument(
+            "--iter-profile-dir", **scheduler_kwargs["iter_profile_dir"]
+        )
+        scheduler_group.add_argument(
             "--stream-interval", **scheduler_kwargs["stream_interval"]
         )
 
@@ -1860,6 +1869,8 @@ class EngineArgs:
             scheduler_reserve_full_isl=self.scheduler_reserve_full_isl,
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
+            iter_profile=self.iter_profile,
+            iter_profile_dir=self.iter_profile_dir,
             stream_interval=self.stream_interval,
         )
 

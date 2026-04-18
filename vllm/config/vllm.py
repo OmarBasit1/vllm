@@ -731,6 +731,34 @@ class VllmConfig:
                     model_type,
                 )
 
+        iter_profile_requested = self.scheduler_config.iter_profile
+        if (
+            iter_profile_requested
+            and self.scheduler_config.async_scheduling is not False
+        ):
+            logger.info_once(
+                "Disabling async scheduling because iter_profile is enabled.",
+                scope="local",
+            )
+            self.scheduler_config.async_scheduling = False
+
+        if iter_profile_requested:
+            if self.parallel_config.pipeline_parallel_size > 1:
+                logger.warning_once(
+                    "iter_profile is ignored when pipeline parallelism is enabled "
+                    "(pipeline_parallel_size=%d).",
+                    self.parallel_config.pipeline_parallel_size,
+                    scope="local",
+                )
+                self.scheduler_config.iter_profile = False
+            elif self.model_config is not None and not self.model_config.is_moe:
+                logger.warning_once(
+                    "iter_profile is only supported for MoE models and will be "
+                    "ignored for non-MoE models.",
+                    scope="local",
+                )
+                self.scheduler_config.iter_profile = False
+
         from vllm.v1.executor.abstract import Executor
 
         executor_backend = self.parallel_config.distributed_executor_backend

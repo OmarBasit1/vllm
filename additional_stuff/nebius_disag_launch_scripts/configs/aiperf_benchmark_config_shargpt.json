@@ -1,0 +1,14 @@
+{
+  "aiperf_binary": "aiperf",
+  "model": "Qwen/Qwen1.5-MoE-A2.7B-Chat",
+  "url": "http://127.0.0.1:9000",
+  "endpoint_type": "chat",
+  "public_dataset": "sharegpt",
+  "streaming": true,
+  "concurrency": 800,
+  "request_rate": 800,
+  "request_count": 24000,
+  "arrival_pattern": "constant",
+  "working_dir": "../nebius_disag_launch_scripts",
+  "extra_args": []
+}

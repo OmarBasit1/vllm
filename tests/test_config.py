@@ -61,6 +61,48 @@ def test_async_scheduling_with_pipeline_parallelism_is_allowed():
     assert cfg.scheduler_config.async_scheduling is True
 
 
+def test_iter_profile_disables_async_scheduling():
+    cfg = VllmConfig(
+        scheduler_config=SchedulerConfig(
+            max_model_len=8192,
+            is_encoder_decoder=False,
+            async_scheduling=True,
+            iter_profile=True,
+        ),
+    )
+    assert cfg.scheduler_config.iter_profile is True
+    assert cfg.scheduler_config.async_scheduling is False
+
+
+def test_iter_profile_with_pipeline_parallelism_is_ignored():
+    cfg = VllmConfig(
+        scheduler_config=SchedulerConfig(
+            max_model_len=8192,
+            is_encoder_decoder=False,
+            async_scheduling=True,
+            iter_profile=True,
+        ),
+        parallel_config=ParallelConfig(
+            pipeline_parallel_size=2,
+            distributed_executor_backend="mp",
+            nnodes=2,
+        ),
+    )
+    assert cfg.scheduler_config.iter_profile is False
+    assert cfg.scheduler_config.async_scheduling is False
+
+
+def test_iter_profile_dir_is_normalized():
+    cfg = SchedulerConfig(
+        max_model_len=8192,
+        is_encoder_decoder=False,
+        iter_profile_dir="~/vllm_iter_profile_test",
+    )
+    assert cfg.iter_profile_dir == os.path.abspath(
+        os.path.expanduser("~/vllm_iter_profile_test")
+    )
+
+
 @dataclass
 class _TestConfigFields:
     a: int
