@@ -3806,6 +3806,8 @@ class GPUModelRunner(
             assert kv_connector_metadata is not None
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
+        self._moe_iteration_timing_start_event: torch.cuda.Event | None = None
+
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with (
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
@@ -3852,6 +3854,13 @@ class GPUModelRunner(
             tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
             if self.moe_profiling_initialized and self.moe_profiler is not None:
                 self.moe_profiler.start_iteration(request_token_counts=tokens)
+                if self.device.type == "cuda":
+                    self._moe_iteration_timing_start_event = torch.cuda.Event(
+                        enable_timing=True
+                    )
+                    self._moe_iteration_timing_start_event.record(
+                        torch.cuda.current_stream()
+                    )
             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
@@ -4057,12 +4066,40 @@ class GPUModelRunner(
                     hidden_states.kv_connector_output = kv_connector_output
                     self.kv_connector_output = kv_connector_output
                     if self.moe_profiling_initialized and self.moe_profiler is not None:
+                        if self._moe_iteration_timing_start_event is not None:
+                            iteration_timing_end_event = torch.cuda.Event(
+                                enable_timing=True
+                            )
+                            iteration_timing_end_event.record(
+                                torch.cuda.current_stream()
+                            )
+                            self.moe_profiler.log_iteration_time(
+                                iteration_timing_events=(
+                                    self._moe_iteration_timing_start_event,
+                                    iteration_timing_end_event,
+                                )
+                            )
+                            self._moe_iteration_timing_start_event = None
                         self.moe_profiler.end_iteration()
                     return hidden_states
 
                 if self.is_pooling_model:
                     # Return the pooling output.
                     if self.moe_profiling_initialized and self.moe_profiler is not None:
+                        if self._moe_iteration_timing_start_event is not None:
+                            iteration_timing_end_event = torch.cuda.Event(
+                                enable_timing=True
+                            )
+                            iteration_timing_end_event.record(
+                                torch.cuda.current_stream()
+                            )
+                            self.moe_profiler.log_iteration_time(
+                                iteration_timing_events=(
+                                    self._moe_iteration_timing_start_event,
+                                    iteration_timing_end_event,
+                                )
+                            )
+                            self._moe_iteration_timing_start_event = None
                         self.moe_profiler.end_iteration()
                     return self._pool(
                         hidden_states,
@@ -4325,6 +4362,16 @@ class GPUModelRunner(
                     logger.error("RoutedExpertsCapturer not initialized.")
 
             if self.moe_profiling_initialized and self.moe_profiler is not None:
+                if self._moe_iteration_timing_start_event is not None:
+                    iteration_timing_end_event = torch.cuda.Event(enable_timing=True)
+                    iteration_timing_end_event.record(torch.cuda.current_stream())
+                    self.moe_profiler.log_iteration_time(
+                        iteration_timing_events=(
+                            self._moe_iteration_timing_start_event,
+                            iteration_timing_end_event,
+                        )
+                    )
+                    self._moe_iteration_timing_start_event = None
                 self.moe_profiler.end_iteration()
 
             output = ModelRunnerOutput(

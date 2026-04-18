@@ -4,10 +4,11 @@
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+import csv
 import json
 import zlib
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -43,7 +44,8 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help=(
-            "Output interactive HTML path (default: <logs_root>/decode_temporal_load.html)."
+            "Output interactive HTML path "
+            "(default: <logs_root>/decode_temporal_load.html)."
         ),
     )
     parser.add_argument(
@@ -52,6 +54,17 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Output CDF PNG path (default: <logs_root>/decode_load_spread_cdf.png)."
+        ),
+    )
+    parser.add_argument(
+        "--iteration-scatter-dir",
+        "--layer-scatter-dir",
+        dest="iteration_scatter_dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory for iteration load-vs-latency scatter artifacts "
+            "(default: <logs_root>/decode_iteration_load_latency)."
         ),
     )
     parser.add_argument(
@@ -132,6 +145,34 @@ def _layer_request_load(layer_record: dict[str, Any]) -> int:
     return layer_load
 
 
+def _iteration_latency_ms(iteration_record: dict[str, Any]) -> float | None:
+    raw_latency = iteration_record.get("iteration_time_ms")
+    if raw_latency is None:
+        return None
+
+    try:
+        latency_ms = float(raw_latency)
+    except (TypeError, ValueError):
+        return None
+
+    if latency_ms < 0:
+        return None
+
+    return latency_ms
+
+
+def _iteration_start_load(iteration_record: dict[str, Any]) -> int:
+    request_token_counts = iteration_record.get("request_token_counts", [])
+    start_load = 0
+    for count in request_token_counts:
+        try:
+            if int(count) > 0:
+                start_load += 1
+        except (TypeError, ValueError):
+            continue
+    return start_load
+
+
 def _decode_chunk_payloads(
     chunk_files: list[Path],
     workers: int,
@@ -146,7 +187,11 @@ def _decode_chunk_payloads(
 def compute_instance_load_metrics(
     instance_dir: Path,
     workers: int,
-) -> tuple[dict[str, list[int]], dict[str, list[int]]]:
+) -> tuple[
+    dict[str, list[int]],
+    dict[str, list[int]],
+    dict[str, list[tuple[int, float]]],
+]:
     temporal_dir = instance_dir / "temporal_expert_logs"
     files_by_rank: dict[str, list[Path]] = defaultdict(list)
     for chunk_file in temporal_dir.glob("*.msgpack.zlib"):
@@ -154,6 +199,9 @@ def compute_instance_load_metrics(
 
     flattened_loads_by_rank: dict[str, list[int]] = {}
     spread_diffs_by_rank: dict[str, list[int]] = {}
+    iteration_latency_points_by_rank: dict[str, list[tuple[int, float]]] = defaultdict(
+        list
+    )
     for rank_key in sorted(files_by_rank):
         flattened_loads: list[int] = []
         spread_diffs: list[int] = []
@@ -169,7 +217,19 @@ def compute_instance_load_metrics(
         for payload in chunk_payloads:
             for iteration in payload.get("iterations", []):
                 layers = iteration.get("layers", [])
-                iteration_layer_loads = [_layer_request_load(layer) for layer in layers]
+                iteration_layer_loads: list[int] = []
+                for layer in layers:
+                    layer_load = _layer_request_load(layer)
+                    iteration_layer_loads.append(layer_load)
+
+                iteration_latency_ms = _iteration_latency_ms(iteration)
+                if iteration_latency_ms is not None:
+                    start_load = _iteration_start_load(iteration)
+                    if start_load > 0:
+                        iteration_latency_points_by_rank[rank_key].append(
+                            (start_load, iteration_latency_ms)
+                        )
+
                 if not iteration_layer_loads:
                     continue
 
@@ -182,7 +242,16 @@ def compute_instance_load_metrics(
         if spread_diffs:
             spread_diffs_by_rank[rank_key] = spread_diffs
 
-    return flattened_loads_by_rank, spread_diffs_by_rank
+    iteration_latency_points_by_rank_dict = {
+        rank_key: points
+        for rank_key, points in sorted(iteration_latency_points_by_rank.items())
+    }
+
+    return (
+        flattened_loads_by_rank,
+        spread_diffs_by_rank,
+        iteration_latency_points_by_rank_dict,
+    )
 
 
 def _build_cdf(values: list[int]) -> tuple[list[int], list[float]]:
@@ -199,25 +268,29 @@ def plot_decode_temporal_load(
     output_path: Path,
     cdf_output_path: Path,
     html_output_path: Path,
+    iteration_scatter_dir: Path,
     show: bool,
     workers: int,
 ) -> None:
     decode_instances = discover_decode_instances(logs_root)
     if not decode_instances:
         raise FileNotFoundError(
-            f"No decode instance directories with temporal logs found under: {logs_root}"
+            "No decode instance directories with temporal logs found under: "
+            f"{logs_root}"
         )
 
     plt.figure(figsize=(12, 6))
     any_data = False
     plot_series: list[tuple[str, list[int]]] = []
     cdf_series: list[tuple[str, list[int], list[float]]] = []
+    iteration_scatter_data: dict[str, list[tuple[int, float]]] = defaultdict(list)
 
     for instance_dir in decode_instances:
-        flattened_loads_by_rank, spread_diffs_by_rank = compute_instance_load_metrics(
-            instance_dir,
-            workers=workers,
-        )
+        (
+            flattened_loads_by_rank,
+            spread_diffs_by_rank,
+            iteration_latency_points_by_rank,
+        ) = compute_instance_load_metrics(instance_dir, workers=workers)
         if not flattened_loads_by_rank:
             continue
 
@@ -237,8 +310,14 @@ def plot_decode_temporal_load(
                 label=series_name,
             )
 
+            scatter_points = iteration_latency_points_by_rank.get(rank_key, [])
+            if scatter_points:
+                iteration_scatter_data[series_name].extend(scatter_points)
+
     if not any_data:
-        raise RuntimeError("Temporal log files were found, but no iteration data was parsed.")
+        raise RuntimeError(
+            "Temporal log files were found, but no iteration data was parsed."
+        )
 
     plt.title("Decode Temporal MoE Load Across Iterations (Layers Flattened)")
     plt.xlabel("Flattened iteration-layer index")
@@ -251,8 +330,12 @@ def plot_decode_temporal_load(
     plt.savefig(output_path, dpi=180)
     print(f"Saved plot: {output_path}")
 
+    if not cdf_series:
+        raise RuntimeError("No load spread data available to build CDF plot.")
+
     plt.figure(figsize=(12, 6))
-    plt.plot(cdf_series[-1][1], cdf_series[-1][2], linewidth=1.7, label=series_name)
+    for series_name, cdf_x, cdf_y in cdf_series:
+        plt.plot(cdf_x, cdf_y, linewidth=1.7, label=series_name)
     plt.title("CDF of Decode Iteration Load Spread (max(layer_load) - min(layer_load))")
     plt.xlabel("Iteration load spread")
     plt.ylabel("CDF")
@@ -273,6 +356,11 @@ def plot_decode_temporal_load(
         cdf_series=cdf_series,
     )
     print(f"Saved interactive HTML: {html_output_path}")
+
+    _write_iteration_load_latency_plot(
+        iteration_scatter_data=iteration_scatter_data,
+        output_dir=iteration_scatter_dir,
+    )
 
     print(f"Decode instances plotted: {len(decode_instances)}")
 
@@ -365,6 +453,63 @@ def _write_interactive_html(
     html_output_path.write_text(html, encoding="utf-8")
 
 
+def _write_iteration_load_latency_plot(
+    iteration_scatter_data: dict[str, list[tuple[int, float]]],
+    output_dir: Path,
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    csv_path = output_dir / "load_latency_points.csv"
+    csv_row_count = 0
+    with csv_path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(["x_load", "y_latency_ms"])
+
+        for series_name in sorted(iteration_scatter_data):
+            points = iteration_scatter_data[series_name]
+            for x_load, y_latency_ms in points:
+                writer.writerow([x_load, y_latency_ms])
+                csv_row_count += 1
+
+    print(f"Saved {csv_row_count} rows to CSV: {csv_path}")
+
+    if csv_row_count == 0:
+        print(
+            "No per-iteration latency data found (iteration_time_ms missing). "
+            f"No scatter plot was written to: {output_dir}"
+        )
+        return
+
+    plt.figure(figsize=(10, 6))
+    for series_name in sorted(iteration_scatter_data):
+        points = iteration_scatter_data[series_name]
+        if not points:
+            continue
+
+        x_load = [load for load, _ in points]
+        y_latency_ms = [latency_ms for _, latency_ms in points]
+        plt.scatter(
+            x_load,
+            y_latency_ms,
+            s=16,
+            alpha=0.65,
+            label=series_name,
+        )
+
+    plt.title("Iteration Start Load vs Iteration Latency")
+    plt.xlabel("Load at iteration start")
+    plt.ylabel("Iteration latency (ms)")
+    plt.ylim((0, 200))
+    plt.grid(alpha=0.3)
+    plt.legend(loc="best")
+    plt.tight_layout()
+
+    output_path = output_dir / "iteration_load_vs_latency.png"
+    plt.savefig(output_path, dpi=180)
+    plt.close()
+    print(f"Saved iteration load-vs-latency plot: {output_path}")
+
+
 def main() -> None:
     args = parse_args()
     logs_root = args.logs_root.expanduser().resolve()
@@ -389,11 +534,18 @@ def main() -> None:
     else:
         cdf_output_path = cdf_output_path.expanduser().resolve()
 
+    iteration_scatter_dir = args.iteration_scatter_dir
+    if iteration_scatter_dir is None:
+        iteration_scatter_dir = logs_root / "decode_iteration_load_latency"
+    else:
+        iteration_scatter_dir = iteration_scatter_dir.expanduser().resolve()
+
     plot_decode_temporal_load(
         logs_root=logs_root,
         output_path=output_path,
         cdf_output_path=cdf_output_path,
         html_output_path=html_output_path,
+        iteration_scatter_dir=iteration_scatter_dir,
         show=args.show,
         workers=args.workers,
     )

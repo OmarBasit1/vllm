@@ -63,6 +63,32 @@ def test_materialize_iteration_record_keeps_only_local_experts() -> None:
     ]
 
 
+def test_materialize_iteration_record_includes_iteration_time_ms() -> None:
+    record = {
+        "iteration_id": 11,
+        "token_count": 2,
+        "layer_ids": [1, 3],
+        "request_token_counts": [2],
+        "expert_ids": torch.tensor(
+            [
+                [[0, 1], [2, 3]],
+                [[4, 5], [6, 7]],
+            ],
+            dtype=torch.int32,
+        ),
+        "iteration_time_ms": 0.125,
+    }
+
+    materialized = MoEProfiler._materialize_iteration_record(record)
+
+    assert materialized["iteration_no"] == 11
+    assert materialized["iteration_time_ms"] == 0.125
+    assert materialized["layers"][0]["layer_no"] == 1
+    assert materialized["layers"][1]["layer_no"] == 3
+    assert "layer_time_ms" not in materialized["layers"][0]
+    assert "layer_time_ms" not in materialized["layers"][1]
+
+
 def test_rank_component_prefers_ep_when_enabled() -> None:
     profiler = MoEProfiler.__new__(MoEProfiler)
     profiler._state_lock = threading.Lock()

@@ -59,6 +59,8 @@ Each chunk contains:
 - `iteration_no`
 - `token_count`
 - `request_token_counts` (token count for each request-position in batch order)
+- `iteration_time_ms` (optional CUDA elapsed time for the full worker
+  iteration on the worker stream, with no explicit stream synchronization)
 - `layers`
   - `layer_no`
   - `request_expert_ids` shaped `[num_requests, tokens_for_request, <=top_k]`

@@ -31,6 +31,7 @@ class _PendingMoERecord:
     layer_ids: list[int]
     request_token_counts: list[int]
     expert_ids_cpu: torch.Tensor
+    iteration_timing_events: tuple[torch.cuda.Event, torch.cuda.Event] | None
     done_event: torch.cuda.Event | None
 
 
@@ -60,6 +61,9 @@ class MoEProfiler:
         self._captured_layer_ids: set[int] = set()
         self._token_count: int = 0
         self._active_request_token_counts: list[int] = []
+        self._active_iteration_timing_events: (
+            tuple[torch.cuda.Event, torch.cuda.Event] | None
+        ) = None
 
         self._active_iteration_id: int | None = None
         self._next_iteration_id: int = 0
@@ -156,6 +160,7 @@ class MoEProfiler:
         self._captured_layer_ids.clear()
         self._token_count = 0
         self._dp_slice = None
+        self._active_iteration_timing_events = None
         if request_token_counts is None:
             self._active_request_token_counts = []
         else:
@@ -201,16 +206,33 @@ class MoEProfiler:
         self._captured_layer_ids.add(layer_id)
         self._token_count = max(self._token_count, token_count)
 
+    def log_iteration_time(
+        self,
+        iteration_timing_events: tuple[torch.cuda.Event, torch.cuda.Event] | None,
+    ) -> None:
+        if iteration_timing_events is None:
+            return
+
+        if self._device_expert_ids is None:
+            return
+
+        if self._active_iteration_id is None:
+            return
+
+        self._active_iteration_timing_events = iteration_timing_events
+
     def end_iteration(self) -> None:
         if self._active_iteration_id is None:
             return
 
         if not self._captured_layer_ids or self._token_count <= 0:
             self._active_iteration_id = None
+            self._active_iteration_timing_events = None
             return
 
         if self._device_expert_ids is None:
             self._active_iteration_id = None
+            self._active_iteration_timing_events = None
             return
 
         layer_ids = sorted(self._captured_layer_ids)
@@ -247,11 +269,13 @@ class MoEProfiler:
                 layer_ids=layer_ids,
                 request_token_counts=local_request_token_counts,
                 expert_ids_cpu=ids_cpu,
+                iteration_timing_events=self._active_iteration_timing_events,
                 done_event=done_event,
             )
         )
 
         self._active_iteration_id = None
+        self._active_iteration_timing_events = None
         self._drain_pending(non_blocking=True)
         if len(self._records) >= self._flush_every:
             self.flush(force=False)
@@ -397,15 +421,33 @@ class MoEProfiler:
                 "layer_ids": pending.layer_ids,
                 "request_token_counts": pending.request_token_counts,
                 "expert_ids": pending.expert_ids_cpu,
+                "iteration_time_ms": self._materialize_iteration_time_ms(
+                    pending.iteration_timing_events
+                ),
             }
             self._records.append(record)
             self._pending.popleft()
+
+    @staticmethod
+    def _materialize_iteration_time_ms(
+        iteration_timing_events: tuple[torch.cuda.Event, torch.cuda.Event] | None,
+    ) -> float | None:
+        if iteration_timing_events is None:
+            return None
+
+        start_event, end_event = iteration_timing_events
+        try:
+            return float(start_event.elapsed_time(end_event))
+        except RuntimeError:
+            return None
 
     def _raise_if_worker_failed(self) -> None:
         with self._state_lock:
             worker_error = self._worker_error
         if worker_error is not None:
-            raise RuntimeError("Temporal MoE log writer thread failed") from worker_error
+            raise RuntimeError(
+                "Temporal MoE log writer thread failed"
+            ) from worker_error
 
     def _writer_loop(self) -> None:
         encoder = msgspec.msgpack.Encoder()
@@ -469,6 +511,13 @@ class MoEProfiler:
             [int(c) for c in record.get("request_token_counts", [])],
             token_count,
         )
+        raw_iteration_time_ms = record.get("iteration_time_ms")
+        iteration_time_ms: float | None = None
+        if raw_iteration_time_ms is not None:
+            try:
+                iteration_time_ms = float(raw_iteration_time_ms)
+            except (TypeError, ValueError):
+                iteration_time_ms = None
 
         expert_ids = record["expert_ids"]
         if not isinstance(expert_ids, torch.Tensor):
@@ -504,12 +553,15 @@ class MoEProfiler:
                 }
             )
 
-        return {
+        materialized = {
             "iteration_no": int(record["iteration_id"]),
             "token_count": token_count,
             "request_token_counts": request_token_counts,
             "layers": layers,
         }
+        if iteration_time_ms is not None:
+            materialized["iteration_time_ms"] = iteration_time_ms
+        return materialized
 
     def _write_chunk(
         self,

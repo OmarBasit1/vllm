@@ -309,19 +309,21 @@ class BaseRouter(FusedMoERouter):
             hidden_states, router_logits, indices_type
         )
 
-        # Capture logical ids before EPLB mapping.
-        if self.capture_fn is not None:
-            self.capture_fn(
-                topk_ids,
-                topk_weights,
-                hidden_states,
-                self._compute_expert_probability_map(router_logits),
-            )
+        logical_topk_ids = topk_ids
 
         # Step 4: Apply EPLB mapping
         topk_ids = self._apply_eplb_mapping(topk_ids)
 
         # Step 5: Convert indices dtype
         topk_ids = self._convert_indices_dtype(topk_ids, indices_type)
+
+        # Capture logical ids before EPLB mapping.
+        if self.capture_fn is not None:
+            self.capture_fn(
+                logical_topk_ids,
+                topk_weights,
+                hidden_states,
+                self._compute_expert_probability_map(router_logits),
+            )
 
         return topk_weights, topk_ids
