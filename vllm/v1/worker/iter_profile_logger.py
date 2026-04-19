@@ -34,6 +34,8 @@ class IterProfileHandle:
     num_scheduled_tokens: int
     start_event: torch.cuda.Event
     start_time_ns: int
+    model_start_event: torch.cuda.Event | None = None
+    model_end_event: torch.cuda.Event | None = None
 
 
 @dataclass
@@ -44,6 +46,9 @@ class _PendingIteration:
     start_event: torch.cuda.Event
     end_event: torch.cuda.Event
     start_time_ns: int
+    expert_timing_pairs: tuple[tuple[torch.cuda.Event, torch.cuda.Event], ...]
+    model_start_event: torch.cuda.Event | None
+    model_end_event: torch.cuda.Event | None
 
 
 class IterProfileLogger:
@@ -146,7 +151,12 @@ class IterProfileLogger:
         self._next_iteration_idx += 1
         return handle
 
-    def finish_iteration(self, handle: IterProfileHandle) -> None:
+    def finish_iteration(
+        self,
+        handle: IterProfileHandle,
+        expert_timing_pairs: tuple[tuple[torch.cuda.Event, torch.cuda.Event],
+                                   ...] = (),
+    ) -> None:
         if self._closed:
             return
 
@@ -160,6 +170,9 @@ class IterProfileLogger:
                 start_event=handle.start_event,
                 end_event=end_event,
                 start_time_ns=handle.start_time_ns,
+                expert_timing_pairs=expert_timing_pairs,
+                model_start_event=handle.model_start_event,
+                model_end_event=handle.model_end_event,
             )
         )
 
@@ -174,7 +187,34 @@ class IterProfileLogger:
             if not pending.end_event.query():
                 break
 
+            expert_ffn_ms: float | None = None
+            if pending.expert_timing_pairs:
+                for _, expert_end in pending.expert_timing_pairs:
+                    if not expert_end.query():
+                        return
+                expert_ffn_ms = sum(
+                    float(expert_start.elapsed_time(expert_end))
+                    for expert_start, expert_end in pending.expert_timing_pairs
+                )
+
             latency_ms = float(pending.start_event.elapsed_time(pending.end_event))
+            model_compute_ms: float | None = None
+            if (
+                pending.model_start_event is not None
+                and pending.model_end_event is not None
+                and pending.model_end_event.query()
+            ):
+                model_compute_ms = float(
+                    pending.model_start_event.elapsed_time(pending.model_end_event)
+                )
+
+            attention_ms: float | None = None
+            if expert_ffn_ms is not None:
+                baseline_ms = (
+                    model_compute_ms if model_compute_ms is not None else latency_ms
+                )
+                attention_ms = max(baseline_ms - expert_ffn_ms, 0.0)
+
             record = {
                 "instance_id": self._instance_id,
                 "global_rank": self._global_rank,
@@ -185,6 +225,9 @@ class IterProfileLogger:
                 "batch_size": pending.batch_size,
                 "num_scheduled_tokens": pending.num_scheduled_tokens,
                 "latency_ms": latency_ms,
+                "model_compute_ms": model_compute_ms,
+                "expert_ffn_ms": expert_ffn_ms,
+                "attention_ms": attention_ms,
                 "start_time_ns": pending.start_time_ns,
                 "end_time_ns": time.time_ns(),
             }
@@ -222,7 +265,7 @@ class IterProfileLogger:
                 self._dropped_records,
             )
 
-    def _enqueue_record(self, record: dict[str, float | int | str]) -> None:
+    def _enqueue_record(self, record: dict[str, float | int | str | None]) -> None:
         line = json.dumps(record, separators=(",", ":"))
         try:
             self._write_queue.put_nowait(line)

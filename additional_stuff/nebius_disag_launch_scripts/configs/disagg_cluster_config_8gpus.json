@@ -21,7 +21,7 @@
     "health_check_interval_sec": 2
   },
   "iter_profile": {
-    "enabled": false,
+    "enabled": true,
     "subdir": "iter_profiles"
   },
   "proxy": {
@@ -46,7 +46,7 @@
     "kv_transfer_fields": {},
     "rpc_port_prefix": "producer",
     "discard_partial_chunks": false,
-    "enforce_eager": true,
+    "enforce_eager": false,
     "enable_prefix_caching": false,
     "max_num_seqs": 256,
     "max_num_batched_tokens": 10000,
@@ -94,7 +94,7 @@
     "kv_transfer_fields": {},
     "rpc_port_prefix": "consumer",
     "discard_partial_chunks": false,
-    "enforce_eager": true,
+    "enforce_eager": false,
     "enable_prefix_caching": false,
     "enable_expert_parallel": true,
     "max_num_seqs": 1024,

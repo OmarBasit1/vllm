@@ -25,6 +25,10 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
     _get_config_dtype_str,
 )
+from vllm.model_executor.layers.fused_moe.iter_timing import (
+    record_moe_expert_end,
+    record_moe_expert_start,
+)
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     moe_align_block_size,
 )
@@ -1822,29 +1826,33 @@ def fused_experts_impl(
         num_tokens_post_padded.fill_(max_num_tokens_padded)
         sorted_token_ids = None
 
-    dispatch_fused_moe_kernel(
-        qhidden_states,
-        w1,
-        intermediate_cache1,
-        a1q_scale,
-        w1_scale,
-        w1_zp,
-        topk_weights,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        apply_router_weight_on_input,
-        top_k_num,
-        config,
-        compute_type=compute_type,
-        use_fp8_w8a8=use_fp8_w8a8,
-        use_int8_w8a8=use_int8_w8a8,
-        use_int8_w8a16=use_int8_w8a16,
-        use_int4_w4a16=use_int4_w4a16,
-        per_channel_quant=per_channel_quant,
-        block_shape=block_shape,
-        B_bias=w1_bias,
-    )
+    w1_timing_handle = record_moe_expert_start(w1)
+    try:
+        dispatch_fused_moe_kernel(
+            qhidden_states,
+            w1,
+            intermediate_cache1,
+            a1q_scale,
+            w1_scale,
+            w1_zp,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            apply_router_weight_on_input,
+            top_k_num,
+            config,
+            compute_type=compute_type,
+            use_fp8_w8a8=use_fp8_w8a8,
+            use_int8_w8a8=use_int8_w8a8,
+            use_int8_w8a16=use_int8_w8a16,
+            use_int4_w4a16=use_int4_w4a16,
+            per_channel_quant=per_channel_quant,
+            block_shape=block_shape,
+            B_bias=w1_bias,
+        )
+    finally:
+        record_moe_expert_end(w1_timing_handle)
 
     apply_moe_activation(
         activation_enum, intermediate_cache2, intermediate_cache1.view(-1, N)
@@ -1862,29 +1870,33 @@ def fused_experts_impl(
     if expert_map is not None:
         intermediate_cache3.zero_()
 
-    dispatch_fused_moe_kernel(
-        qintermediate_cache2,
-        w2,
-        intermediate_cache3,
-        a2q_scale,
-        w2_scale,
-        w2_zp,
-        topk_weights,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        not apply_router_weight_on_input,
-        1,
-        config,
-        compute_type=compute_type,
-        use_fp8_w8a8=use_fp8_w8a8,
-        use_int8_w8a8=use_int8_w8a8,
-        use_int8_w8a16=use_int8_w8a16,
-        use_int4_w4a16=use_int4_w4a16,
-        per_channel_quant=per_channel_quant,
-        block_shape=block_shape,
-        B_bias=w2_bias,
-    )
+    w2_timing_handle = record_moe_expert_start(w2)
+    try:
+        dispatch_fused_moe_kernel(
+            qintermediate_cache2,
+            w2,
+            intermediate_cache3,
+            a2q_scale,
+            w2_scale,
+            w2_zp,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            not apply_router_weight_on_input,
+            1,
+            config,
+            compute_type=compute_type,
+            use_fp8_w8a8=use_fp8_w8a8,
+            use_int8_w8a8=use_int8_w8a8,
+            use_int8_w8a16=use_int8_w8a16,
+            use_int4_w4a16=use_int4_w4a16,
+            per_channel_quant=per_channel_quant,
+            block_shape=block_shape,
+            B_bias=w2_bias,
+        )
+    finally:
+        record_moe_expert_end(w2_timing_handle)
 
     ops.moe_sum(
         intermediate_cache3.view(*intermediate_cache3.size()),

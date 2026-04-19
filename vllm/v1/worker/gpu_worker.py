@@ -38,6 +38,11 @@ from vllm.distributed.parallel_state import (
 from vllm.distributed.weight_transfer import WeightTransferEngineFactory
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
+from vllm.model_executor.layers.fused_moe.iter_timing import (
+    finish_moe_iteration_timing_events,
+    set_moe_iteration_timing_enabled,
+    start_moe_iteration_timing,
+)
 from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.platforms import current_platform
 from vllm.profiler.wrapper import CudaProfilerWrapper, TorchProfilerWrapper
@@ -315,6 +320,7 @@ class Worker(WorkerBase):
 
             self.model_runner = GPUModelRunnerV1(self.vllm_config, self.device)
 
+        set_moe_iteration_timing_enabled(False)
         if self.scheduler_config.iter_profile:
             try:
                 self.iter_profile_logger = IterProfileLogger.from_vllm_config(
@@ -322,11 +328,13 @@ class Worker(WorkerBase):
                     global_rank=self.rank,
                     local_rank=self.local_rank,
                 )
+                set_moe_iteration_timing_enabled(True)
             except Exception:
                 logger.exception(
                     "Failed to initialize iter profile logger; disabling iter_profile."
                 )
                 self.iter_profile_logger = None
+                set_moe_iteration_timing_enabled(False)
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
@@ -786,6 +794,7 @@ class Worker(WorkerBase):
             self._poll_iter_profile()
             return
 
+        start_moe_iteration_timing()
         self._poll_iter_profile()
         self._iter_profile_inflight = self.iter_profile_logger.start_iteration(
             batch_size=len(scheduler_output.num_scheduled_tokens),
@@ -799,7 +808,11 @@ class Worker(WorkerBase):
             self._poll_iter_profile()
             return
 
-        self.iter_profile_logger.finish_iteration(self._iter_profile_inflight)
+        expert_timing_pairs = finish_moe_iteration_timing_events()
+        self.iter_profile_logger.finish_iteration(
+            self._iter_profile_inflight,
+            expert_timing_pairs=expert_timing_pairs,
+        )
         self._iter_profile_inflight = None
 
     @torch.inference_mode()
@@ -865,9 +878,23 @@ class Worker(WorkerBase):
             )
 
         with self.annotate_profile(scheduler_output):
+            iter_handle = self._iter_profile_inflight
+            if iter_handle is not None and iter_handle.model_start_event is None:
+                iter_handle.model_start_event = torch.cuda.Event(enable_timing=True)
+                iter_handle.model_start_event.record()
+
             output = self.model_runner.execute_model(
                 scheduler_output, intermediate_tensors
             )
+
+            if (
+                iter_handle is not None
+                and iter_handle.model_start_event is not None
+                and iter_handle.model_end_event is None
+            ):
+                iter_handle.model_end_event = torch.cuda.Event(enable_timing=True)
+                iter_handle.model_end_event.record()
+
             if (
                 self.use_v2_model_runner
                 and self.model_runner.is_pooling_model
@@ -1080,6 +1107,7 @@ class Worker(WorkerBase):
             self.iter_profile_logger.close()
             self.iter_profile_logger = None
             self._iter_profile_inflight = None
+            set_moe_iteration_timing_enabled(False)
 
         if self.profiler is not None:
             self.profiler.shutdown()
