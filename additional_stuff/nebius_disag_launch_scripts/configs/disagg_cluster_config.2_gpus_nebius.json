@@ -30,7 +30,7 @@
     "port": 9000,
     "request_timeout_sec": 600
   },
-  "common_vllm_args": [],
+  "common_vllm_args": ["--moe-backend=flashinfer_cutlass"],
   "prefill": {
     "count": 1,
     "tp_size": 1,
