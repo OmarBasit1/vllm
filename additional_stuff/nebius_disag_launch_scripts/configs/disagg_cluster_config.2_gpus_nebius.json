@@ -1,7 +1,7 @@
 {
   "model": "Qwen/Qwen1.5-MoE-A2.7B-Chat",
   "working_dir": "../../../examples/others/lmcache/disagg_prefill_lmcache_v1",
-  "main_log_dir": "../../../../logs/qwen1.5_2.7B/per_iter_times_nebius/4TP1Prefill_1TP1Decode/sharegpt_800bs",
+  "main_log_dir": "../../../../logs/qwen1.5_2.7B/per_iter_times_nebius/4TP1Prefill_1TP1Decode/sharegpt",
   "proxy_script": "../disagg_proxy_pool.py",  
   "vllm_command": "vllm",
   "python_executable": "python3",
@@ -82,7 +82,7 @@
   "decode": {
     "count": 1,
     "tp_size": 1,
-    "gpu_groups": [[1]],
+    "gpu_groups": [[4]],
     "bind_host": "0.0.0.0",
     "connect_host": "127.0.0.1",
     "port_start": 8200,
