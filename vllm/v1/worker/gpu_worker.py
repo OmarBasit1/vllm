@@ -769,7 +769,7 @@ class Worker(WorkerBase):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        self._poll_iter_profile()
+        # self._poll_iter_profile()
         output = self.model_runner.sample_tokens(grammar_output)
         self._finish_iter_profile_iteration()
         return output

@@ -18,22 +18,27 @@ _enabled = False
 _iteration_active = False
 _iteration_pairs: list[_ExpertTimingPair] = []
 _last_pairs: tuple[_ExpertTimingPair, ...] = ()
+_event_pool: list[_ExpertTimingPair] = []
+_pool_idx = 0
 
 
 def set_moe_iteration_timing_enabled(enabled: bool) -> None:
-    global _enabled, _iteration_active, _last_pairs
+    global _enabled, _iteration_active, _last_pairs, _event_pool, _pool_idx
     _enabled = enabled
     _iteration_active = False
     _iteration_pairs.clear()
     _last_pairs = ()
+    _event_pool.clear()
+    _pool_idx = 0
 
 
 def start_moe_iteration_timing() -> None:
-    global _iteration_active
+    global _iteration_active, _pool_idx
     if not _enabled:
         return
     _iteration_active = True
     _iteration_pairs.clear()
+    _pool_idx = 0
 
 
 def finish_moe_iteration_timing_events(
@@ -56,13 +61,20 @@ def finish_moe_iteration_timing_events(
 
 
 def record_moe_expert_start(_weight: torch.Tensor) -> _ExpertTimingPair | None:
+    global _pool_idx
     if not _enabled or not _iteration_active:
         return None
 
-    pair = _ExpertTimingPair(
-        start_event=torch.cuda.Event(enable_timing=True),
-        end_event=torch.cuda.Event(enable_timing=True),
-    )
+    if _pool_idx >= len(_event_pool):
+        _event_pool.append(
+            _ExpertTimingPair(
+                start_event=torch.cuda.Event(enable_timing=True),
+                end_event=torch.cuda.Event(enable_timing=True),
+            )
+        )
+
+    pair = _event_pool[_pool_idx]
+    _pool_idx += 1
     _iteration_pairs.append(pair)
 
     pair.start_event.record()

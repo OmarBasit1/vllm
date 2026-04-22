@@ -569,6 +569,21 @@ def build_instances_and_commands(
 
             env = dict(os.environ)
             env.update(global_env)
+            
+            # --- Dynamically inject CONDA_PREFIX/lib into LD_LIBRARY_PATH if it's missing ---
+            conda_prefix = env.get("CONDA_PREFIX")
+            if conda_prefix:
+                conda_lib_path = os.path.join(conda_prefix, "lib")
+                current_ld_lib_path = env.get("LD_LIBRARY_PATH", "")
+                
+                # Check if it's already there to prevent duplicates
+                if conda_lib_path not in current_ld_lib_path.split(os.pathsep):
+                    if current_ld_lib_path:
+                        env["LD_LIBRARY_PATH"] = f"{conda_lib_path}{os.pathsep}{current_ld_lib_path}"
+                    else:
+                        env["LD_LIBRARY_PATH"] = conda_lib_path
+            # ----------------------------------------------------------------------------------
+
             env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in assigned_gpus)
             if kv_transfer_backend == "lmcache":
                 lmcache_cfg_text = str(

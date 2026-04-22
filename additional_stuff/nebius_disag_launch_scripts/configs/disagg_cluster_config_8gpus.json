@@ -1,7 +1,7 @@
 {
   "model": "Qwen/Qwen1.5-MoE-A2.7B-Chat",
   "working_dir": "../../../examples/others/lmcache/disagg_prefill_lmcache_v1",
-  "main_log_dir": "../../../../logs/qwen1.5_2.7B/sharegpt_800bs",
+  "main_log_dir": "../../../../logs/qwen1.5_2.7B/per_iter_times_nebius/4TP1Prefill_1TP4Decode/sharegpt_800bs",
   "proxy_script": "../disagg_proxy_pool.py",  
   "vllm_command": "vllm",
   "python_executable": "python3",
@@ -30,7 +30,7 @@
     "port": 9000,
     "request_timeout_sec": 600
   },
-  "common_vllm_args": [],
+  "common_vllm_args": ["--moe-backend=flashinfer_cutlass"],
   "prefill": {
     "count": 4,
     "tp_size": 1,
@@ -46,7 +46,7 @@
     "kv_transfer_fields": {},
     "rpc_port_prefix": "producer",
     "discard_partial_chunks": false,
-    "enforce_eager": false,
+    "enforce_eager": true,
     "enable_prefix_caching": false,
     "max_num_seqs": 256,
     "max_num_batched_tokens": 10000,
@@ -94,7 +94,7 @@
     "kv_transfer_fields": {},
     "rpc_port_prefix": "consumer",
     "discard_partial_chunks": false,
-    "enforce_eager": false,
+    "enforce_eager": true,
     "enable_prefix_caching": false,
     "enable_expert_parallel": true,
     "max_num_seqs": 1024,
