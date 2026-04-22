@@ -25,10 +25,6 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
     _get_config_dtype_str,
 )
-from vllm.model_executor.layers.fused_moe.iter_timing import (
-    record_moe_expert_end,
-    record_moe_expert_start,
-)
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     moe_align_block_size,
 )
@@ -1661,248 +1657,239 @@ def fused_experts_impl(
     w1_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    w1_timing_handle = record_moe_expert_start(w1)
-    try:
-        # Convert string activation to enum for internal use
-        activation_enum = MoEActivation.from_str(activation)
+    # Convert string activation to enum for internal use
+    activation_enum = MoEActivation.from_str(activation)
 
-        # Check constraints.
-        if use_int4_w4a16:
-            assert hidden_states.size(1) // 2 == w1.size(2), "Hidden size mismatch"
-        elif ocp_mx_scheme is not None:
-            if ocp_mx_scheme.startswith("w_mxfp4"):
-                # 16bit activation and fp4x2 packed weight
-                assert hidden_states.size(1) == w1.size(2) * 2, "hidden size mismatch"
-            elif ocp_mx_scheme.startswith("w_mxfp6"):
-                assert hidden_states.size(1) == (w1.size(2) * 4) // 3, (
-                    "hidden size mismatch"
-                )
-            else:
-                raise NotImplementedError(f"Unsupported ocp_mx_scheme={ocp_mx_scheme}")
-        else:
-            assert hidden_states.size(1) == w1.size(2), (
-                f"Hidden size mismatch {hidden_states.size(1)} != {w1.size(2)}"
-            )
-
-        assert topk_weights.size() == topk_ids.size(), "topk shape mismatch"
-        assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
-        assert w1.stride(-1) == 1, "Stride of last dimension must be 1"
-        assert w2.stride(-1) == 1, "Stride of last dimension must be 1"
-        assert hidden_states.dtype in [torch.float32, torch.float16, torch.bfloat16]
-
-        num_tokens = hidden_states.size(0)
-        E, N, _ = w1.size()
-        K = w2.size(1)
-        if global_num_experts == -1:
-            global_num_experts = E
-        top_k_num = topk_ids.size(1)
-
-        M = num_tokens
-
-        config_dtype = _get_config_dtype_str(
-            use_fp8_w8a8=use_fp8_w8a8,
-            use_int8_w8a16=use_int8_w8a16,
-            use_int4_w4a16=use_int4_w4a16,
-            ocp_mx_scheme=ocp_mx_scheme,
-            dtype=hidden_states.dtype,
-        )
-
-        # Note: for use_int8_w8a16 or use_int4_w4a16, the activations are
-        # quantized prior to calling fused_experts.
-        quant_dtype = _get_config_quant_dtype(
-            use_fp8_w8a8=use_fp8_w8a8,
-            use_int8_w8a8=use_int8_w8a8,
-            ocp_mx_scheme=ocp_mx_scheme,
-        )
-
-        get_config_func = functools.partial(
-            try_get_optimal_moe_config,
-            w1.size(),
-            w2.size(),
-            top_k_num,
-            config_dtype,
-            block_shape=block_shape,
-        )
-
-        config = get_config_func(M)
-
-        # We can reuse the memory between these because by the time we need
-        # cache3, we're done with cache1
-        cache13 = torch.empty(
-            M * top_k_num * max(N, K),
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
-        intermediate_cache1 = cache13[: M * top_k_num * N].view(M, top_k_num, N)
-        intermediate_cache3 = cache13[: M * top_k_num * K].view(M, top_k_num, K)
-
-        # This needs separate memory since it's used concurrently with cache1
-        activation_out_dim = mk.FusedMoEExpertsModular.adjust_N_for_activation(
-            N, activation_enum
-        )
-        intermediate_cache2 = torch.empty(
-            (M * top_k_num, activation_out_dim),
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
-
-        if hidden_states.dtype == torch.bfloat16:
-            compute_type = tl.bfloat16
-        elif hidden_states.dtype == torch.float16:
-            compute_type = tl.float16
-        elif hidden_states.dtype == torch.float32:
-            compute_type = tl.float32
-        else:
-            raise ValueError(f"Unsupported compute_type: {hidden_states.dtype}")
-
-        out_hidden_states = hidden_states if inplace else torch.empty_like(hidden_states)
-
-        if ocp_mx_scheme is not None:
-            # TODO: On platforms for which `current_platform.supports_mx()` is True
-            # and for which we have a native OCP mx fused MOE kernel,
-            # this dequantization step should not be done.
-            if ocp_mx_scheme.startswith("w_mxfp4"):
-                # Weight has to be dequantized for mxfp4 emulation.
-                w1 = dequant_mxfp4(w1, w1_scale, hidden_states.dtype)
-                w1_scale = None
-                w2 = dequant_mxfp4(w2, w2_scale, hidden_states.dtype)
-                w2_scale = None
-            elif ocp_mx_scheme.startswith("w_mxfp6_e3m2"):
-                w1 = dequant_mxfp6(
-                    w1, w1_scale, quant_dtype="fp6_e3m2", float_dtype=hidden_states.dtype
-                )
-                w1_scale = None
-                w2 = dequant_mxfp6(
-                    w2, w2_scale, quant_dtype="fp6_e3m2", float_dtype=hidden_states.dtype
-                )
-                w2_scale = None
-            elif ocp_mx_scheme.startswith("w_mxfp6_e2m3"):
-                w1 = dequant_mxfp6(
-                    w1, w1_scale, quant_dtype="fp6_e2m3", float_dtype=hidden_states.dtype
-                )
-                w1_scale = None
-                w2 = dequant_mxfp6(
-                    w2, w2_scale, quant_dtype="fp6_e2m3", float_dtype=hidden_states.dtype
-                )
-                w2_scale = None
-            else:
-                raise NotImplementedError(f"Unsupported ocp_mx_scheme={ocp_mx_scheme}")
-
-        qhidden_states, a1q_scale = moe_kernel_quantize_input(
-            A=hidden_states,
-            A_scale=a1_scale,
-            quant_dtype=quant_dtype,
-            per_act_token_quant=per_channel_quant,
-            block_shape=block_shape,
-            ocp_mx_scheme=ocp_mx_scheme,
-        )
-
-        # SPARSITY_FACTOR is a heuristic margin ensuring num_tokens * top_k
-        # activates only a small fraction of total experts
-        SPARSITY_FACTOR = 4
-        # block quantized code path is not implemented yet.
-        naive_block_assignment = (
-            expert_map is None
-            and num_tokens * top_k_num * SPARSITY_FACTOR <= global_num_experts
-            and not (
-                (use_int8_w8a16 or use_int4_w4a16)
-                and block_shape is not None
-                and block_shape[1] > 0
-            )
-        )
-
-        if not naive_block_assignment:
-            sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-                topk_ids,
-                config["BLOCK_SIZE_M"],
-                global_num_experts,
-                expert_map,
-                ignore_invalid_experts=True,
+    # Check constraints.
+    if use_int4_w4a16:
+        assert hidden_states.size(1) // 2 == w1.size(2), "Hidden size mismatch"
+    elif ocp_mx_scheme is not None:
+        if ocp_mx_scheme.startswith("w_mxfp4"):
+            # 16bit activation and fp4x2 packed weight
+            assert hidden_states.size(1) == w1.size(2) * 2, "hidden size mismatch"
+        elif ocp_mx_scheme.startswith("w_mxfp6"):
+            assert hidden_states.size(1) == (w1.size(2) * 4) // 3, (
+                "hidden size mismatch"
             )
         else:
-            max_num_tokens_padded = topk_ids.numel() * config["BLOCK_SIZE_M"]
-            expert_ids = topk_ids.view(-1)
-            num_tokens_post_padded = torch.empty(
-                (1), dtype=torch.int32, device=topk_ids.device
+            raise NotImplementedError(f"Unsupported ocp_mx_scheme={ocp_mx_scheme}")
+    else:
+        assert hidden_states.size(1) == w1.size(2), (
+            f"Hidden size mismatch {hidden_states.size(1)} != {w1.size(2)}"
+        )
+
+    assert topk_weights.size() == topk_ids.size(), "topk shape mismatch"
+    assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
+    assert w1.stride(-1) == 1, "Stride of last dimension must be 1"
+    assert w2.stride(-1) == 1, "Stride of last dimension must be 1"
+    assert hidden_states.dtype in [torch.float32, torch.float16, torch.bfloat16]
+
+    num_tokens = hidden_states.size(0)
+    E, N, _ = w1.size()
+    K = w2.size(1)
+    if global_num_experts == -1:
+        global_num_experts = E
+    top_k_num = topk_ids.size(1)
+
+    M = num_tokens
+
+    config_dtype = _get_config_dtype_str(
+        use_fp8_w8a8=use_fp8_w8a8,
+        use_int8_w8a16=use_int8_w8a16,
+        use_int4_w4a16=use_int4_w4a16,
+        ocp_mx_scheme=ocp_mx_scheme,
+        dtype=hidden_states.dtype,
+    )
+
+    # Note: for use_int8_w8a16 or use_int4_w4a16, the activations are
+    # quantized prior to calling fused_experts.
+    quant_dtype = _get_config_quant_dtype(
+        use_fp8_w8a8=use_fp8_w8a8,
+        use_int8_w8a8=use_int8_w8a8,
+        ocp_mx_scheme=ocp_mx_scheme,
+    )
+
+    get_config_func = functools.partial(
+        try_get_optimal_moe_config,
+        w1.size(),
+        w2.size(),
+        top_k_num,
+        config_dtype,
+        block_shape=block_shape,
+    )
+
+    config = get_config_func(M)
+
+    # We can reuse the memory between these because by the time we need
+    # cache3, we're done with cache1
+    cache13 = torch.empty(
+        M * top_k_num * max(N, K),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
+    intermediate_cache1 = cache13[: M * top_k_num * N].view(M, top_k_num, N)
+    intermediate_cache3 = cache13[: M * top_k_num * K].view(M, top_k_num, K)
+
+    # This needs separate memory since it's used concurrently with cache1
+    activation_out_dim = mk.FusedMoEExpertsModular.adjust_N_for_activation(
+        N, activation_enum
+    )
+    intermediate_cache2 = torch.empty(
+        (M * top_k_num, activation_out_dim),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
+
+    if hidden_states.dtype == torch.bfloat16:
+        compute_type = tl.bfloat16
+    elif hidden_states.dtype == torch.float16:
+        compute_type = tl.float16
+    elif hidden_states.dtype == torch.float32:
+        compute_type = tl.float32
+    else:
+        raise ValueError(f"Unsupported compute_type: {hidden_states.dtype}")
+
+    out_hidden_states = hidden_states if inplace else torch.empty_like(hidden_states)
+
+    if ocp_mx_scheme is not None:
+        # TODO: On platforms for which `current_platform.supports_mx()` is True
+        # and for which we have a native OCP mx fused MOE kernel,
+        # this dequantization step should not be done.
+        if ocp_mx_scheme.startswith("w_mxfp4"):
+            # Weight has to be dequantized for mxfp4 emulation.
+            w1 = dequant_mxfp4(w1, w1_scale, hidden_states.dtype)
+            w1_scale = None
+            w2 = dequant_mxfp4(w2, w2_scale, hidden_states.dtype)
+            w2_scale = None
+        elif ocp_mx_scheme.startswith("w_mxfp6_e3m2"):
+            w1 = dequant_mxfp6(
+                w1, w1_scale, quant_dtype="fp6_e3m2", float_dtype=hidden_states.dtype
             )
-            num_tokens_post_padded.fill_(max_num_tokens_padded)
-            sorted_token_ids = None
+            w1_scale = None
+            w2 = dequant_mxfp6(
+                w2, w2_scale, quant_dtype="fp6_e3m2", float_dtype=hidden_states.dtype
+            )
+            w2_scale = None
+        elif ocp_mx_scheme.startswith("w_mxfp6_e2m3"):
+            w1 = dequant_mxfp6(
+                w1, w1_scale, quant_dtype="fp6_e2m3", float_dtype=hidden_states.dtype
+            )
+            w1_scale = None
+            w2 = dequant_mxfp6(
+                w2, w2_scale, quant_dtype="fp6_e2m3", float_dtype=hidden_states.dtype
+            )
+            w2_scale = None
+        else:
+            raise NotImplementedError(f"Unsupported ocp_mx_scheme={ocp_mx_scheme}")
 
-    
-        dispatch_fused_moe_kernel(
-            qhidden_states,
-            w1,
-            intermediate_cache1,
-            a1q_scale,
-            w1_scale,
-            w1_zp,
-            topk_weights,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            apply_router_weight_on_input,
-            top_k_num,
-            config,
-            compute_type=compute_type,
-            use_fp8_w8a8=use_fp8_w8a8,
-            use_int8_w8a8=use_int8_w8a8,
-            use_int8_w8a16=use_int8_w8a16,
-            use_int4_w4a16=use_int4_w4a16,
-            per_channel_quant=per_channel_quant,
-            block_shape=block_shape,
-            B_bias=w1_bias,
+    qhidden_states, a1q_scale = moe_kernel_quantize_input(
+        A=hidden_states,
+        A_scale=a1_scale,
+        quant_dtype=quant_dtype,
+        per_act_token_quant=per_channel_quant,
+        block_shape=block_shape,
+        ocp_mx_scheme=ocp_mx_scheme,
+    )
+
+    # SPARSITY_FACTOR is a heuristic margin ensuring num_tokens * top_k
+    # activates only a small fraction of total experts
+    SPARSITY_FACTOR = 4
+    # block quantized code path is not implemented yet.
+    naive_block_assignment = (
+        expert_map is None
+        and num_tokens * top_k_num * SPARSITY_FACTOR <= global_num_experts
+        and not (
+            (use_int8_w8a16 or use_int4_w4a16)
+            and block_shape is not None
+            and block_shape[1] > 0
         )
-    finally:
-        record_moe_expert_end(w1_timing_handle)
+    )
 
-    w2_timing_handle = record_moe_expert_start(w2)
-    try:
-        apply_moe_activation(
-            activation_enum, intermediate_cache2, intermediate_cache1.view(-1, N)
+    if not naive_block_assignment:
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            topk_ids,
+            config["BLOCK_SIZE_M"],
+            global_num_experts,
+            expert_map,
+            ignore_invalid_experts=True,
         )
-
-        qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
-            A=intermediate_cache2,
-            A_scale=a2_scale,
-            quant_dtype=quant_dtype,
-            per_act_token_quant=per_channel_quant,
-            block_shape=block_shape,
-            ocp_mx_scheme=ocp_mx_scheme,
+    else:
+        max_num_tokens_padded = topk_ids.numel() * config["BLOCK_SIZE_M"]
+        expert_ids = topk_ids.view(-1)
+        num_tokens_post_padded = torch.empty(
+            (1), dtype=torch.int32, device=topk_ids.device
         )
+        num_tokens_post_padded.fill_(max_num_tokens_padded)
+        sorted_token_ids = None
 
-        if expert_map is not None:
-            intermediate_cache3.zero_()
 
-        dispatch_fused_moe_kernel(
-            qintermediate_cache2,
-            w2,
-            intermediate_cache3,
-            a2q_scale,
-            w2_scale,
-            w2_zp,
-            topk_weights,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            not apply_router_weight_on_input,
-            1,
-            config,
-            compute_type=compute_type,
-            use_fp8_w8a8=use_fp8_w8a8,
-            use_int8_w8a8=use_int8_w8a8,
-            use_int8_w8a16=use_int8_w8a16,
-            use_int4_w4a16=use_int4_w4a16,
-            per_channel_quant=per_channel_quant,
-            block_shape=block_shape,
-            B_bias=w2_bias,
-        )
-        ops.moe_sum(
+    dispatch_fused_moe_kernel(
+        qhidden_states,
+        w1,
+        intermediate_cache1,
+        a1q_scale,
+        w1_scale,
+        w1_zp,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        apply_router_weight_on_input,
+        top_k_num,
+        config,
+        compute_type=compute_type,
+        use_fp8_w8a8=use_fp8_w8a8,
+        use_int8_w8a8=use_int8_w8a8,
+        use_int8_w8a16=use_int8_w8a16,
+        use_int4_w4a16=use_int4_w4a16,
+        per_channel_quant=per_channel_quant,
+        block_shape=block_shape,
+        B_bias=w1_bias,
+    )
+
+    apply_moe_activation(
+        activation_enum, intermediate_cache2, intermediate_cache1.view(-1, N)
+    )
+
+    qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
+        A=intermediate_cache2,
+        A_scale=a2_scale,
+        quant_dtype=quant_dtype,
+        per_act_token_quant=per_channel_quant,
+        block_shape=block_shape,
+        ocp_mx_scheme=ocp_mx_scheme,
+    )
+
+    if expert_map is not None:
+        intermediate_cache3.zero_()
+
+    dispatch_fused_moe_kernel(
+        qintermediate_cache2,
+        w2,
+        intermediate_cache3,
+        a2q_scale,
+        w2_scale,
+        w2_zp,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        not apply_router_weight_on_input,
+        1,
+        config,
+        compute_type=compute_type,
+        use_fp8_w8a8=use_fp8_w8a8,
+        use_int8_w8a8=use_int8_w8a8,
+        use_int8_w8a16=use_int8_w8a16,
+        use_int4_w4a16=use_int4_w4a16,
+        per_channel_quant=per_channel_quant,
+        block_shape=block_shape,
+        B_bias=w2_bias,
+    )
+    ops.moe_sum(
         intermediate_cache3.view(*intermediate_cache3.size()),
         out_hidden_states,
     )
-        
-    finally:
-        record_moe_expert_end(w2_timing_handle)
 
     return out_hidden_states
 

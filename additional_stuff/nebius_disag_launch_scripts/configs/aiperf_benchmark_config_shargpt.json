@@ -5,9 +5,9 @@
   "endpoint_type": "chat",
   "public_dataset": "sharegpt",
   "streaming": true,
-  "concurrency": 40,
-  "request_rate": 40,
-  "request_count": 240,
+  "concurrency": 200,
+  "request_rate": 200,
+  "request_count": 1000,
   "arrival_pattern": "constant",
   "working_dir": "../nebius_disag_launch_scripts",
   "extra_args": []
