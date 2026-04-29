@@ -6183,6 +6183,7 @@ class GPUModelRunner(
                 full_cls_name = attn_backend.full_cls_name()
                 layer_kv_cache_spec = kv_cache_group_spec.kv_cache_spec
                 if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
+                    if layer_name not in layer_kv_cache_spec.kv_cache_specs: print(f"MISSING: {layer_name}, available: {layer_kv_cache_spec.kv_cache_specs.keys()}", flush=True)
                     layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
                 key = (full_cls_name, layer_kv_cache_spec)
                 attn_backends[key] = AttentionGroupKey(

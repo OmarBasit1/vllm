@@ -383,7 +383,14 @@ class Llama4DecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.feed_forward(hidden_states)
+
+        from vllm.model_executor.layers.fused_moe.iter_timing import record_moe_expert_start, record_moe_expert_end
+        timing_handle = record_moe_expert_start()
+        try:
+            hidden_states = self.feed_forward(hidden_states)
+        finally:
+            record_moe_expert_end(timing_handle)
+            
         return hidden_states, residual
 
 
