@@ -19,6 +19,10 @@ _iteration_active = False
 _iteration_pairs: list[_ExpertTimingPair] = []
 _last_pairs: tuple[_ExpertTimingPair, ...] = ()
 
+_buffer_size = 30
+_event_buffer: list[_ExpertTimingPair] = []
+_buffer_idx = 0
+
 
 def set_moe_iteration_timing_enabled(enabled: bool) -> None:
     global _enabled, _iteration_active, _last_pairs
@@ -56,13 +60,20 @@ def finish_moe_iteration_timing_events(
 
 
 def record_moe_expert_start(_weight: torch.Tensor | None = None) -> _ExpertTimingPair | None:
+    global _buffer_idx, _event_buffer
     if not _enabled or not _iteration_active:
         return None
 
-    pair = _ExpertTimingPair(
-        start_event=torch.cuda.Event(enable_timing=True),
-        end_event=torch.cuda.Event(enable_timing=True),
-    )
+    if not _event_buffer:
+        for _ in range(_buffer_size):
+            _event_buffer.append(_ExpertTimingPair(
+                start_event=torch.cuda.Event(enable_timing=True),
+                end_event=torch.cuda.Event(enable_timing=True)
+            ))
+
+    pair = _event_buffer[_buffer_idx]
+    _buffer_idx = (_buffer_idx + 1) % _buffer_size
+    
     _iteration_pairs.append(pair)
 
     pair.start_event.record()
