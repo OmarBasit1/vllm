@@ -107,6 +107,7 @@ def benchmark_config(
     num_iters: int = 100,
     block_quant_shape: list[int] = None,
     use_deep_gemm: bool = False,
+    balanced_experts: bool = False,
 ) -> float:
     init_dtype = torch.float16 if use_fp8_w8a8 else dtype
     x = torch.randn(num_tokens, hidden_size, dtype=dtype)
@@ -275,9 +276,26 @@ def benchmark_config(
             )
 
         with override_config(config):
-            topk_weights, topk_ids, token_expert_indices = fused_topk(
-                x, input_gating, topk, renormalize=not use_deep_gemm
-            )
+            if balanced_experts:
+                # Deterministic balanced routing: every token is sent to every
+                # expert, so each expert receives exactly num_tokens tokens.
+                # Effective topk = num_experts.
+                topk_ids = (
+                    torch.arange(num_experts, device=x.device, dtype=torch.int32)
+                    .unsqueeze(0)
+                    .expand(num_tokens, num_experts)
+                    .contiguous()
+                )
+                topk_weights = torch.full(
+                    (num_tokens, num_experts),
+                    1.0 / num_experts,
+                    dtype=torch.float32,
+                    device=x.device,
+                )
+            else:
+                topk_weights, topk_ids, token_expert_indices = fused_topk(
+                    x, input_gating, topk, renormalize=not use_deep_gemm
+                )
 
             inplace = not disable_inplace()
             if use_deep_gemm:
@@ -373,8 +391,8 @@ def get_configs_compute_bound(use_fp16, block_quant_shape) -> list[dict[str, int
         # Reduced search space for faster tuning.
         # TODO(woosuk): Increase the search space and use a performance model to
         # prune the search space.
-        block_m_range = [16, 32, 64, 128, 256]
-        block_n_range = [32, 64, 128, 256]
+        block_m_range = [16, 32, 64, 128, ]
+        block_n_range = [32, 64, 128, ]
         block_k_range = [64, 128, 256]
         num_warps_range = [4, 8]
         group_m_range = [1, 16, 32, 64]
@@ -543,6 +561,7 @@ class BenchmarkWorker:
         use_int4_w4a16: bool = False,
         block_quant_shape: list[int] = None,
         use_deep_gemm: bool = False,
+        balanced_experts: bool = False,
     ) -> tuple[dict[str, int], float]:
         # local import to allow serialization by ray
 
@@ -553,6 +572,10 @@ class BenchmarkWorker:
             use_fp8_w8a8=use_fp8_w8a8,
             use_int4_w4a16=use_int4_w4a16,
         )
+        # When balanced_experts is set, every token is broadcast to every
+        # expert so the effective topk for kernel-config selection is the
+        # number of experts (per rank).
+        effective_topk = num_experts if balanced_experts else topk
         # NOTE(woosuk): The current naming convention uses w2.shape[2], which
         # is the intermediate size after silu_and_mul.
         block_n = block_quant_shape[0] if block_quant_shape else None
@@ -566,7 +589,7 @@ class BenchmarkWorker:
                 num_experts,
                 shard_intermediate_size,
                 hidden_size,
-                topk,
+                effective_topk,
                 dtype_str,
                 block_quant_shape,
             )
@@ -578,7 +601,7 @@ class BenchmarkWorker:
             num_experts,
             shard_intermediate_size,
             hidden_size,
-            topk,
+            effective_topk,
             dtype,
             use_fp8_w8a8,
             use_int8_w8a16,
@@ -586,6 +609,7 @@ class BenchmarkWorker:
             num_iters=100,
             block_quant_shape=block_quant_shape,
             use_deep_gemm=use_deep_gemm,
+            balanced_experts=balanced_experts,
         )
         return config, kernel_time
 
@@ -876,14 +900,33 @@ def main(args: argparse.Namespace):
     if args.model_prefix:
         config = getattr(config, args.model_prefix)
     E, topk, intermediate_size, hidden_size = get_model_params(config)
+    total_experts = E
     enable_ep = bool(args.enable_expert_parallel)
-    if enable_ep:
+    # --ep-degree decouples expert parallelism from tensor parallelism.
+    # If set explicitly (>1), it controls expert sharding regardless of TP.
+    # Otherwise, --enable-expert-parallel preserves the legacy behavior of
+    # tying EP-degree to TP-size.
+    if args.ep_degree > 1:
+        ep_degree = args.ep_degree
+        ensure_divisibility(E, ep_degree, "Number of experts")
+        E = E // ep_degree
+        ensure_divisibility(intermediate_size, args.tp_size, "intermediate_size")
+        shard_intermediate_size = 2 * intermediate_size // args.tp_size
+    elif enable_ep:
+        ep_degree = args.tp_size
         ensure_divisibility(E, args.tp_size, "Number of experts")
         E = E // args.tp_size
         shard_intermediate_size = 2 * intermediate_size
     else:
+        ep_degree = 1
         ensure_divisibility(intermediate_size, args.tp_size, "intermediate_size")
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
+    print(
+        f"Total experts: {total_experts}, ep_degree: {ep_degree}, "
+        f"experts per GPU: {E}, tp_size: {args.tp_size}, "
+        f"shard_intermediate_size: {shard_intermediate_size}, "
+        f"balanced_experts: {bool(args.balanced_experts)}"
+    )
     dtype = resolve_dtype(config)
     use_fp8_w8a8 = args.dtype == "fp8_w8a8"
     use_int8_w8a16 = args.dtype == "int8_w8a16"
@@ -1029,6 +1072,7 @@ def main(args: argparse.Namespace):
                     use_int4_w4a16,
                     block_quant_shape,
                     use_deep_gemm,
+                    bool(args.balanced_experts),
                 )
                 for batch_size in batch_sizes
             ],
@@ -1048,6 +1092,25 @@ if __name__ == "__main__":
         "--tp-size", "-tp", "--tensor-parallel-size", type=int, default=2
     )
     parser.add_argument("--enable-expert-parallel", "-enable-ep", action="store_true")
+    parser.add_argument(
+        "--ep-degree",
+        type=int,
+        default=1,
+        help="Expert-parallel degree, independent of --tp-size. The total number "
+        "of experts is divided across this many EP ranks; the benchmark runs "
+        "with E / ep_degree experts per GPU. Defaults to 1 (no EP). When set "
+        "to a value > 1, takes precedence over --enable-expert-parallel and "
+        "TP sharding still applies to intermediate_size via --tp-size.",
+    )
+    parser.add_argument(
+        "--balanced-experts",
+        action="store_true",
+        help="Replace top-k routing on random gating logits with deterministic "
+        "balanced routing where every expert receives exactly batch_size "
+        "tokens (each input token is broadcast to all experts; effective "
+        "topk = num_experts). Useful for measuring per-expert kernel "
+        "behavior independent of routing distribution.",
+    )
     parser.add_argument(
         "--dtype",
         type=str,
