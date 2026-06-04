@@ -743,6 +743,12 @@ class Scheduler(SchedulerInterface):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
+                    # Allow subclasses (e.g. MARS) to reclaim GPU blocks from a
+                    # lower-priority waiting request and retry admission for this
+                    # one.  The default returns False (stock break behaviour).
+                    if self._reclaim_blocks_for_admission(request,
+                                                          num_new_tokens):
+                        continue
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -931,6 +937,18 @@ class Scheduler(SchedulerInterface):
         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
         return connector.build_connector_meta(scheduler_output)
+
+    def _reclaim_blocks_for_admission(
+        self, request: Request, num_new_tokens: int
+    ) -> bool:
+        """Try to free GPU blocks so ``request`` can be admitted.
+
+        Called when ``allocate_slots`` returns ``None`` for a waiting request.
+        Subclasses (e.g. MARS) override this to evict a lower-priority
+        KV-holding waiting request and return ``True`` so the caller retries
+        admission.  The default preserves stock behaviour (unconditional break).
+        """
+        return False
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:
         """Preempt a request and put it back to the waiting queue.
