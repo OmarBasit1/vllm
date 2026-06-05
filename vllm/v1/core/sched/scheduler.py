@@ -941,12 +941,16 @@ class Scheduler(SchedulerInterface):
     def _reclaim_blocks_for_admission(
         self, request: Request, num_new_tokens: int
     ) -> bool:
-        """Try to free GPU blocks so ``request`` can be admitted.
+        """Hook to free GPU blocks when ``request`` cannot be admitted.
 
-        Called when ``allocate_slots`` returns ``None`` for a waiting request.
+        Called when ``allocate_slots`` returns ``None`` for a waiting request,
+        immediately before the caller ``break``s out of the admission loop.
         Subclasses (e.g. MARS) override this to evict a lower-priority
-        KV-holding waiting request and return ``True`` so the caller retries
-        admission.  The default preserves stock behaviour (unconditional break).
+        KV-holding waiting request so the freed memory is available on the next
+        ``schedule()`` step.  NOTE: the caller does **not** retry admission in
+        the same step and ignores the return value (it always breaks); the bool
+        is advisory only.  The default is a no-op that preserves stock
+        behaviour.
         """
         return False
 
