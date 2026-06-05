@@ -229,6 +229,15 @@ class SimpleCPUOffloadScheduler:
     ) -> tuple[int | None, bool]:
         """Return (num_new_tokens, is_async) from consecutive CPU cache hits."""
 
+        # MARS may set skip_reading_prefix_cache=True on a reclaimed WFRKV
+        # request to prevent re-entering WAITING_FOR_REMOTE_KVS on the very
+        # next admission (the CPU blocks are still in the LRU cache and would
+        # otherwise be found immediately, causing a free→WFRKV churn cycle).
+        if getattr(request, "skip_reading_prefix_cache", False):
+            if stale := self._pending_cpu_hits.pop(request.request_id, None):
+                self._free_pending_cpu_hit(stale)
+            return 0, False
+
         # Pins found CPU blocks so they survive LRU eviction until
         # update_state_after_alloc() consumes them. Any pin from an earlier
         # call on the same request (e.g. retry after a failed allocate_slots)
@@ -768,6 +777,25 @@ class SimpleCPUOffloadScheduler:
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
         return self.request_finished(request, block_ids=[])
+
+    def cancel_load_for_request(self, request: "Request") -> None:
+        """Cancel any in-progress or pending CPU→GPU KV load for ``request``.
+
+        Called by MARS when reclaiming a ``WAITING_FOR_REMOTE_KVS`` request to
+        free its GPU blocks and prevent the load from completing into freed
+        blocks.  Drops the pending CPU-hit pin (so the next call to
+        ``get_num_new_matched_tokens`` performs a fresh lookup from address 0)
+        and cancels the in-flight load state if present.  The CPU blocks
+        themselves (in ``cpu_coordinator``) are NOT evicted — the CPU copy
+        remains available for future reloads.
+        """
+        req_id = request.request_id
+        # Release any temporary CPU block pin from get_num_new_matched_tokens().
+        pending = self._pending_cpu_hits.pop(req_id, None)
+        if pending is not None:
+            self._free_pending_cpu_hit(pending)
+        # Cancel the in-flight load if one was registered by update_state_after_alloc.
+        self._cleanup_load_request(req_id)
 
     def _free_pending_cpu_hit(self, pending: tuple) -> None:
         """Release the temporary CPU block pin taken in get_num_new_matched_tokens()."""

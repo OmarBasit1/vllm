@@ -746,9 +746,9 @@ class Scheduler(SchedulerInterface):
                     # Allow subclasses (e.g. MARS) to reclaim GPU blocks from a
                     # lower-priority waiting request and retry admission for this
                     # one.  The default returns False (stock break behaviour).
-                    if self._reclaim_blocks_for_admission(request,
-                                                          num_new_tokens):
-                        continue
+                    # The MARS override also returns False (defers to next step)
+                    # so this never loops; the break always fires.
+                    self._reclaim_blocks_for_admission(request, num_new_tokens)
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -2188,9 +2188,11 @@ class Scheduler(SchedulerInterface):
             req = self.requests[req_id]
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                 self.finished_recving_kv_req_ids.add(req_id)
-            else:
-                assert RequestStatus.is_finished(req.status)
+            elif RequestStatus.is_finished(req.status):
                 self._free_blocks(self.requests[req_id])
+            # else: MARS (or another scheduler extension) may have cancelled
+            # this transfer and reset the request to WAITING; ignore stale
+            # completion rather than asserting.
         for req_id in kv_connector_output.finished_sending or ():
             logger.debug("Finished sending KV transfer for request %s", req_id)
             assert req_id in self.requests

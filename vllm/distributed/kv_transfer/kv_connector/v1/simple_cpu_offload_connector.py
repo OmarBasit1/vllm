@@ -234,6 +234,11 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             )
         return False, None
 
+    def cancel_load_for_request(self, request: "Request") -> None:
+        """Cancel any in-progress CPU→GPU load for ``request`` (MARS reclaim)."""
+        if self.scheduler_manager is not None:
+            self.scheduler_manager.cancel_load_for_request(request)
+
     # NOTE: New API only for SimpleCPUOffloadConnector.
     def has_pending_transfers(self) -> bool:
         if self.scheduler_manager is not None:

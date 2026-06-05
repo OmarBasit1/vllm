@@ -560,6 +560,14 @@ class KVConnectorBase_V1(ABC):
         """
         return False, None
 
+    def cancel_load_for_request(self, request: "Request") -> None:
+        """Cancel any in-progress or pending CPU→GPU KV load for ``request``.
+
+        Called by MARS when reclaiming a ``WAITING_FOR_REMOTE_KVS`` victim to
+        free its GPU blocks without leaving a dangling in-flight transfer.
+        The default is a no-op; ``SimpleCPUOffloadScheduler`` overrides this.
+        """
+
     def take_events(self) -> Iterable["KVCacheEvent"]:
         """
         Take the KV cache events from the connector.
