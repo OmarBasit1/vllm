@@ -73,11 +73,12 @@ def test_moe_iteration_layers_include_expert_probabilities():
         ],
         dtype=np.float16,
     )
-    routed_layer0_input_embeddings = np.array(
+    # Per-layer gate inputs: shape (num_tokens, num_layers, hidden_size).
+    routed_gate_inputs = np.array(
         [
-            [0.11, 0.12, 0.13],
-            [0.21, 0.22, 0.23],
-            [0.31, 0.32, 0.33],
+            [[0.11, 0.12, 0.13], [0.14, 0.15, 0.16]],
+            [[0.21, 0.22, 0.23], [0.24, 0.25, 0.26]],
+            [[0.31, 0.32, 0.33], [0.34, 0.35, 0.36]],
         ],
         dtype=np.float16,
     )
@@ -85,7 +86,7 @@ def test_moe_iteration_layers_include_expert_probabilities():
     out = MoERequestLogger.build_iteration_layers(
         routed_experts,
         routed_expert_probabilities,
-        routed_layer0_input_embeddings,
+        routed_gate_inputs,
         moe_iter_token_counts=[(0, 2), (1, 1)],
     )
 
@@ -105,11 +106,21 @@ def test_moe_iteration_layers_include_expert_probabilities():
         ),
         atol=1e-3,
     )
+    # gate_input lives per layer; layer 0 holds tokens 0 and 1 of iteration 0.
+    assert "gate_input" in first_layer
     assert np.allclose(
-        np.array(out[0]["layer0_input_embedding"], dtype=np.float32),
+        np.array(first_layer["gate_input"], dtype=np.float32),
         np.array([[0.11, 0.12, 0.13], [0.21, 0.22, 0.23]], dtype=np.float32),
         atol=1e-3,
     )
+    second_layer = out[0]["layers"][1]
+    assert np.allclose(
+        np.array(second_layer["gate_input"], dtype=np.float32),
+        np.array([[0.14, 0.15, 0.16], [0.24, 0.25, 0.26]], dtype=np.float32),
+        atol=1e-3,
+    )
+    # The former iteration-level layer0 embedding field is removed.
+    assert "layer0_input_embedding" not in out[0]
 
     # top-k over full probability map reproduces routed experts.
     recovered = np.argsort(
@@ -153,12 +164,12 @@ def test_moe_request_logger_writes_lossless_per_request_binary(tmp_path):
             {
                 "iter_no": 0,
                 "token_count": 1,
-                "layer0_input_embedding": [[0.25, 0.5]],
                 "layers": [
                     {
                         "layer_no": 0,
                         "expert_ids": [[1, 3]],
                         "expert_probabilities": [[0.1, 0.2, 0.3, 0.4]],
+                        "gate_input": [[0.25, 0.5]],
                     }
                 ],
             }
@@ -171,12 +182,12 @@ def test_moe_request_logger_writes_lossless_per_request_binary(tmp_path):
             {
                 "iter_no": 1,
                 "token_count": 1,
-                "layer0_input_embedding": [[1.0, 2.0]],
                 "layers": [
                     {
                         "layer_no": 0,
                         "expert_ids": [[2, 0]],
                         "expert_probabilities": [[0.7, 0.2, 0.1, 0.0]],
+                        "gate_input": [[1.0, 2.0]],
                     }
                 ],
             }

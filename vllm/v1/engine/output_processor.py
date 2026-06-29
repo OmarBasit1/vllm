@@ -185,7 +185,7 @@ class MoERequestLogger:
     def build_iteration_layers(
         routed_experts: np.ndarray | None,
         routed_expert_probabilities: np.ndarray | None,
-        routed_layer0_input_embeddings: np.ndarray | None,
+        routed_gate_inputs: np.ndarray | None,
         moe_iter_token_counts: list[tuple[int, int]] | None,
     ) -> list[dict[str, Any]] | None:
         if routed_experts is None or moe_iter_token_counts is None:
@@ -198,10 +198,10 @@ class MoERequestLogger:
             and routed_expert_probabilities.ndim == 3
             and routed_expert_probabilities.shape[:2] == routed_experts.shape[:2]
         )
-        include_layer0_input_embeddings = (
-            routed_layer0_input_embeddings is not None
-            and routed_layer0_input_embeddings.ndim == 2
-            and routed_layer0_input_embeddings.shape[0] == routed_experts.shape[0]
+        include_gate_inputs = (
+            routed_gate_inputs is not None
+            and routed_gate_inputs.ndim == 3
+            and routed_gate_inputs.shape[:2] == routed_experts.shape[:2]
         )
 
         total_tokens = int(routed_experts.shape[0])
@@ -221,10 +221,10 @@ class MoERequestLogger:
                 and routed_expert_probabilities is not None
                 else None
             )
-            token_layer0_input_slice = (
-                routed_layer0_input_embeddings[offset:end]
-                if include_layer0_input_embeddings
-                and routed_layer0_input_embeddings is not None
+            token_gate_input_slice = (
+                routed_gate_inputs[offset:end]
+                if include_gate_inputs
+                and routed_gate_inputs is not None
                 else None
             )
             layers = []
@@ -237,16 +237,15 @@ class MoERequestLogger:
                     layer_record["expert_probabilities"] = (
                         token_probability_slice[:, layer_no, :].tolist()
                     )
+                if token_gate_input_slice is not None:
+                    layer_record["gate_input"] = (
+                        token_gate_input_slice[:, layer_no, :].tolist()
+                    )
                 layers.append(layer_record)
             iterations.append(
                 {
                     "iter_no": int(iter_no),
                     "token_count": int(end - offset),
-                    "layer0_input_embedding": (
-                        token_layer0_input_slice.tolist()
-                        if token_layer0_input_slice is not None
-                        else None
-                    ),
                     "layers": layers,
                 }
             )
@@ -263,10 +262,10 @@ class MoERequestLogger:
                 and routed_expert_probabilities is not None
                 else None
             )
-            token_layer0_input_slice = (
-                routed_layer0_input_embeddings[offset:total_tokens]
-                if include_layer0_input_embeddings
-                and routed_layer0_input_embeddings is not None
+            token_gate_input_slice = (
+                routed_gate_inputs[offset:total_tokens]
+                if include_gate_inputs
+                and routed_gate_inputs is not None
                 else None
             )
             layers = []
@@ -279,16 +278,15 @@ class MoERequestLogger:
                     layer_record["expert_probabilities"] = (
                         token_probability_slice[:, layer_no, :].tolist()
                     )
+                if token_gate_input_slice is not None:
+                    layer_record["gate_input"] = (
+                        token_gate_input_slice[:, layer_no, :].tolist()
+                    )
                 layers.append(layer_record)
             iterations.append(
                 {
                     "iter_no": fallback_iter,
                     "token_count": int(total_tokens - offset),
-                    "layer0_input_embedding": (
-                        token_layer0_input_slice.tolist()
-                        if token_layer0_input_slice is not None
-                        else None
-                    ),
                     "layers": layers,
                 }
             )
@@ -953,7 +951,7 @@ class OutputProcessor:
             "moe_expert_activation": MoERequestLogger.build_iteration_layers(
                 engine_core_output.routed_experts,
                 engine_core_output.routed_expert_probabilities,
-                engine_core_output.routed_layer0_input_embeddings,
+                engine_core_output.routed_gate_inputs,
                 engine_core_output.moe_iter_token_counts,
             ),
         }

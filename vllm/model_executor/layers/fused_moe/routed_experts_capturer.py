@@ -29,7 +29,9 @@ _TMP_DIR = tempfile.gettempdir()
 _LOCK_FILE_PREFIX = os.path.join(_TMP_DIR, "vllm_routed_experts")
 _BUFFER_PREFIX = "vllm_routed_experts_buffer"
 _PROBABILITY_BUFFER_PREFIX = "vllm_routed_experts_probability_buffer"
-_LAYER0_INPUT_BUFFER_PREFIX = "vllm_routed_experts_layer0_input_buffer"
+# Per-layer gate input (= RMSNorm(residual + attention) fed to each MoE gate).
+# Replaces the former layer-0-only input embedding buffer.
+_GATE_INPUT_BUFFER_PREFIX = "vllm_routed_experts_gate_input_buffer"
 
 # Global singleton instances
 _global_experts_capturer: RoutedExpertsCapturer | None = None
@@ -91,15 +93,15 @@ class RoutedExpertsCapturer:
     def __init__(self) -> None:
         self._device_buffer: torch.Tensor | None = None
         self._device_probability_buffer: torch.Tensor | None = None
-        self._device_layer0_input_buffer: torch.Tensor | None = None
+        self._device_gate_input_buffer: torch.Tensor | None = None
         self._num_experts = 0
         self._hidden_size = 0
         self._shm: shared_memory.SharedMemory | None = None
         self._probability_shm: shared_memory.SharedMemory | None = None
-        self._layer0_input_shm: shared_memory.SharedMemory | None = None
+        self._gate_input_shm: shared_memory.SharedMemory | None = None
         self._host_buffer_view: np.ndarray | None = None
         self._host_probability_buffer_view: np.ndarray | None = None
-        self._host_layer0_input_buffer_view: np.ndarray | None = None
+        self._host_gate_input_buffer_view: np.ndarray | None = None
         self._lock_file: str | None = None
 
     @classmethod
@@ -158,8 +160,8 @@ class RoutedExpertsCapturer:
             dtype=torch.float16,
             device=current_platform.device_type,
         )
-        self._device_layer0_input_buffer = torch.zeros(
-            (max_num_batched_tokens, hidden_size),
+        self._device_gate_input_buffer = torch.zeros(
+            (max_num_batched_tokens, num_layers, hidden_size),
             dtype=torch.float16,
             device=current_platform.device_type,
         )
@@ -171,13 +173,13 @@ class RoutedExpertsCapturer:
         # Initialize shared memory
         shape = (max_num_kv_tokens, num_layers, num_experts_per_tok)
         probability_shape = (max_num_kv_tokens, num_layers, num_experts)
-        layer0_input_shape = (max_num_kv_tokens, hidden_size)
+        gate_input_shape = (max_num_kv_tokens, num_layers, hidden_size)
         buffer_size = int(np.prod(shape)) * np.dtype(np.int32).itemsize
         probability_buffer_size = (
             int(np.prod(probability_shape)) * np.dtype(np.float16).itemsize
         )
-        layer0_input_buffer_size = (
-            int(np.prod(layer0_input_shape)) * np.dtype(np.float16).itemsize
+        gate_input_buffer_size = (
+            int(np.prod(gate_input_shape)) * np.dtype(np.float16).itemsize
         )
         instance_id = vllm_config.instance_id
         self._lock_file = f"{_LOCK_FILE_PREFIX}_{instance_id}_{self.dp_rank}.lock"
@@ -185,8 +187,8 @@ class RoutedExpertsCapturer:
         probability_shm_name = (
             f"{_PROBABILITY_BUFFER_PREFIX}_{instance_id}_{self.dp_rank}"
         )
-        layer0_input_shm_name = (
-            f"{_LAYER0_INPUT_BUFFER_PREFIX}_{instance_id}_{self.dp_rank}"
+        gate_input_shm_name = (
+            f"{_GATE_INPUT_BUFFER_PREFIX}_{instance_id}_{self.dp_rank}"
         )
 
         self._shm = _create_or_attach_shared_memory(
@@ -195,9 +197,9 @@ class RoutedExpertsCapturer:
         self._probability_shm = _create_or_attach_shared_memory(
             probability_shm_name, probability_buffer_size, self._lock_file
         )
-        self._layer0_input_shm = _create_or_attach_shared_memory(
-            layer0_input_shm_name,
-            layer0_input_buffer_size,
+        self._gate_input_shm = _create_or_attach_shared_memory(
+            gate_input_shm_name,
+            gate_input_buffer_size,
             self._lock_file,
         )
         self._host_buffer_view = np.ndarray(shape, dtype=np.int32, buffer=self._shm.buf)
@@ -206,14 +208,14 @@ class RoutedExpertsCapturer:
             dtype=np.float16,
             buffer=self._probability_shm.buf,
         )
-        self._host_layer0_input_buffer_view = np.ndarray(
-            layer0_input_shape,
+        self._host_gate_input_buffer_view = np.ndarray(
+            gate_input_shape,
             dtype=np.float16,
-            buffer=self._layer0_input_shm.buf,
+            buffer=self._gate_input_shm.buf,
         )
         self._host_buffer_view.fill(0)
         self._host_probability_buffer_view.fill(0)
-        self._host_layer0_input_buffer_view.fill(0)
+        self._host_gate_input_buffer_view.fill(0)
 
         logger.debug(
             "Created shared memory buffer '%s' with shape %s",
@@ -246,9 +248,9 @@ class RoutedExpertsCapturer:
             raise RuntimeError(
                 "Probability buffer not initialized. Call init_buffer() first."
             )
-        if self._device_layer0_input_buffer is None:
+        if self._device_gate_input_buffer is None:
             raise RuntimeError(
-                "Layer-0 input buffer not initialized. Call init_buffer() first."
+                "Gate input buffer not initialized. Call init_buffer() first."
             )
 
         ctx = get_forward_context()
@@ -269,10 +271,10 @@ class RoutedExpertsCapturer:
         topk_ids_for_dp = topk_ids[start_loc:end_loc, :]
         self._device_buffer[:token_num_per_dp, layer_id, :] = topk_ids_for_dp
 
-        if layer_id == 0 and hidden_states is not None:
-            layer0_input_for_dp = hidden_states[start_loc:end_loc, :]
-            self._device_layer0_input_buffer[:token_num_per_dp, :] = (
-                layer0_input_for_dp.to(dtype=self._device_layer0_input_buffer.dtype)
+        if hidden_states is not None:
+            gate_input_for_dp = hidden_states[start_loc:end_loc, :]
+            self._device_gate_input_buffer[:token_num_per_dp, layer_id, :] = (
+                gate_input_for_dp.to(dtype=self._device_gate_input_buffer.dtype)
             )
 
         prob_slice = self._device_probability_buffer[:token_num_per_dp, layer_id, :]
@@ -317,8 +319,8 @@ class RoutedExpertsCapturer:
             self._device_buffer.zero_()
         if self._device_probability_buffer is not None:
             self._device_probability_buffer.zero_()
-        if self._device_layer0_input_buffer is not None:
-            self._device_layer0_input_buffer.zero_()
+        if self._device_gate_input_buffer is not None:
+            self._device_gate_input_buffer.zero_()
 
     def save_captured_experts(self, indices: np.ndarray) -> None:
         """
@@ -335,28 +337,28 @@ class RoutedExpertsCapturer:
             return
         if self._host_probability_buffer_view is None:
             return
-        if self._host_layer0_input_buffer_view is None:
+        if self._host_gate_input_buffer_view is None:
             return
         if self._device_buffer is None:
             raise RuntimeError("Device buffer not initialized.")
         if self._device_probability_buffer is None:
             raise RuntimeError("Probability device buffer not initialized.")
-        if self._device_layer0_input_buffer is None:
-            raise RuntimeError("Layer-0 input device buffer not initialized.")
+        if self._device_gate_input_buffer is None:
+            raise RuntimeError("Gate input device buffer not initialized.")
 
         num_tokens = len(indices)
         data = self._device_buffer[:num_tokens, :, :].cpu().numpy()
         probability_data = self._device_probability_buffer[
             :num_tokens, :, :
         ].cpu().numpy()
-        layer0_input_data = self._device_layer0_input_buffer[
-            :num_tokens, :
+        gate_input_data = self._device_gate_input_buffer[
+            :num_tokens, :, :
         ].cpu().numpy()
 
         with _file_lock(self._lock_file):
             self._host_buffer_view[indices, :, :] = data
             self._host_probability_buffer_view[indices, :, :] = probability_data
-            self._host_layer0_input_buffer_view[indices, :] = layer0_input_data
+            self._host_gate_input_buffer_view[indices, :, :] = gate_input_data
 
     def cleanup(self) -> None:
         """Explicitly clean up shared memory resources."""
@@ -379,17 +381,17 @@ class RoutedExpertsCapturer:
                 )
             finally:
                 self._probability_shm = None
-        if self._layer0_input_shm is not None:
+        if self._gate_input_shm is not None:
             try:
-                self._layer0_input_shm.close()
-                self._layer0_input_shm.unlink()
+                self._gate_input_shm.close()
+                self._gate_input_shm.unlink()
             except Exception:
                 logger.debug(
-                    "Exception during layer-0 input cleanup for capturer",
+                    "Exception during gate input cleanup for capturer",
                     exc_info=True,
                 )
             finally:
-                self._layer0_input_shm = None
+                self._gate_input_shm = None
 
     def __del__(self) -> None:
         """Clean up shared memory on destruction."""
@@ -409,10 +411,10 @@ class RoutedExpertsReader:
     def __init__(self) -> None:
         self._shm: shared_memory.SharedMemory | None = None
         self._probability_shm: shared_memory.SharedMemory | None = None
-        self._layer0_input_shm: shared_memory.SharedMemory | None = None
+        self._gate_input_shm: shared_memory.SharedMemory | None = None
         self._host_buffer_view: np.ndarray | None = None
         self._host_probability_buffer_view: np.ndarray | None = None
-        self._host_layer0_input_buffer_view: np.ndarray | None = None
+        self._host_gate_input_buffer_view: np.ndarray | None = None
         self._lock_file: str | None = None
 
     @classmethod
@@ -465,7 +467,11 @@ class RoutedExpertsReader:
             hf_config.num_hidden_layers,
             num_experts,
         )
-        layer0_input_shape = (max_num_kv_tokens, hidden_size)
+        gate_input_shape = (
+            max_num_kv_tokens,
+            hf_config.num_hidden_layers,
+            hidden_size,
+        )
 
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
         instance_id = vllm_config.instance_id
@@ -474,8 +480,8 @@ class RoutedExpertsReader:
         probability_shm_name = (
             f"{_PROBABILITY_BUFFER_PREFIX}_{instance_id}_{self.dp_rank}"
         )
-        layer0_input_shm_name = (
-            f"{_LAYER0_INPUT_BUFFER_PREFIX}_{instance_id}_{self.dp_rank}"
+        gate_input_shm_name = (
+            f"{_GATE_INPUT_BUFFER_PREFIX}_{instance_id}_{self.dp_rank}"
         )
 
         with _file_lock(self._lock_file, mode="rb+"):
@@ -488,8 +494,8 @@ class RoutedExpertsReader:
                 self._probability_shm = shared_memory.SharedMemory(
                     name=probability_shm_name
                 )
-                self._layer0_input_shm = shared_memory.SharedMemory(
-                    name=layer0_input_shm_name
+                self._gate_input_shm = shared_memory.SharedMemory(
+                    name=gate_input_shm_name
                 )
 
             self._host_buffer_view = np.ndarray(
@@ -500,10 +506,10 @@ class RoutedExpertsReader:
                 dtype=np.float16,
                 buffer=self._probability_shm.buf,
             )
-            self._host_layer0_input_buffer_view = np.ndarray(
-                layer0_input_shape,
+            self._host_gate_input_buffer_view = np.ndarray(
+                gate_input_shape,
                 dtype=np.float16,
-                buffer=self._layer0_input_shm.buf,
+                buffer=self._gate_input_shm.buf,
             )
 
     def get_routed_experts(self, indices: np.ndarray) -> np.ndarray:
@@ -544,25 +550,26 @@ class RoutedExpertsReader:
         with _file_lock(self._lock_file, mode="rb+"):
             return self._host_probability_buffer_view[indices, :, :].copy()
 
-    def get_layer0_input_embeddings(self, indices: np.ndarray) -> np.ndarray:
+    def get_gate_inputs(self, indices: np.ndarray) -> np.ndarray:
         """
-        Read layer-0 input embeddings from shared memory.
+        Read per-layer MoE gate inputs from shared memory.
 
         Args:
             indices: Array of indices to read.
 
         Returns:
-            Copy of the layer-0 input embeddings for the given indices.
+            Copy of the per-layer gate inputs for the given indices, shaped
+            (num_indices, num_layers, hidden_size).
         """
-        if self._host_layer0_input_buffer_view is None:
+        if self._host_gate_input_buffer_view is None:
             raise RuntimeError(
-                "Layer-0 input buffer not attached. Call attach_buffer() first."
+                "Gate input buffer not attached. Call attach_buffer() first."
             )
         if self._lock_file is None:
             raise RuntimeError("Lock file not initialized.")
 
         with _file_lock(self._lock_file, mode="rb+"):
-            return self._host_layer0_input_buffer_view[indices, :].copy()
+            return self._host_gate_input_buffer_view[indices, :, :].copy()
 
     def cleanup(self) -> None:
         """Explicitly clean up resources (close without unlink)."""
@@ -583,16 +590,16 @@ class RoutedExpertsReader:
                 )
             finally:
                 self._probability_shm = None
-        if self._layer0_input_shm is not None:
+        if self._gate_input_shm is not None:
             try:
-                self._layer0_input_shm.close()
+                self._gate_input_shm.close()
             except Exception:
                 logger.debug(
-                    "Exception during layer-0 input cleanup for reader",
+                    "Exception during gate input cleanup for reader",
                     exc_info=True,
                 )
             finally:
-                self._layer0_input_shm = None
+                self._gate_input_shm = None
 
     def __del__(self) -> None:
         """Close shared memory on destruction (do not unlink)."""

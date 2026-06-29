@@ -1446,14 +1446,14 @@ class Scheduler(SchedulerInterface):
 
             routed_experts = None
             routed_expert_probabilities = None
-            routed_layer0_input_embeddings = None
+            routed_gate_inputs = None
             moe_iter_token_counts = None
             finish_reason = None
             if stopped:
                 (
                     routed_experts,
                     routed_expert_probabilities,
-                    routed_layer0_input_embeddings,
+                    routed_gate_inputs,
                 ) = (
                     self._get_routed_expert_profile(request)
                 )
@@ -1527,7 +1527,7 @@ class Scheduler(SchedulerInterface):
                         num_external_computed_tokens=request.num_external_computed_tokens,
                         routed_experts=routed_experts,
                         routed_expert_probabilities=routed_expert_probabilities,
-                        routed_layer0_input_embeddings=routed_layer0_input_embeddings,
+                        routed_gate_inputs=routed_gate_inputs,
                         moe_iter_token_counts=moe_iter_token_counts,
                         num_nans_in_logits=request.num_nans_in_logits,
                     )
@@ -1691,12 +1691,12 @@ class Scheduler(SchedulerInterface):
                 indices=slot_mapping
             )
         )
-        layer0_input_embeddings = (
-            self.routed_experts_reader.get_layer0_input_embeddings(
+        gate_inputs = (
+            self.routed_experts_reader.get_gate_inputs(
                 indices=slot_mapping
             )
         )
-        return routed_experts, routed_expert_probabilities, layer0_input_embeddings
+        return routed_experts, routed_expert_probabilities, gate_inputs
 
     def _consume_moe_iteration_schedule(
         self, req_id: str, expected_tokens: int | None = None

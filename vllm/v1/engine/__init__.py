@@ -163,7 +163,8 @@ class EngineCoreOutput(
     num_external_computed_tokens: int = 0
     routed_experts: np.ndarray | None = None
     routed_expert_probabilities: np.ndarray | None = None
-    routed_layer0_input_embeddings: np.ndarray | None = None
+    # Per-layer MoE gate inputs, shaped (num_tokens, num_layers, hidden_size).
+    routed_gate_inputs: np.ndarray | None = None
     # Optional per-request MoE iteration token schedule for profiling.
     # Each entry is (iteration_id, num_tokens_for_request_in_iteration).
     moe_iter_token_counts: list[tuple[int, int]] | None = None
