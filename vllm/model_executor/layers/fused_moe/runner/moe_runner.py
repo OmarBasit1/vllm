@@ -47,6 +47,7 @@ from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExperts,
     SharedExpertsOrder,
 )
+from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import (
     _USE_LAYERNAME,
@@ -577,13 +578,28 @@ class MoERunner(MoERunnerInterface):
                 input_ids=input_ids,
             )
 
-            fused_out = self.routed_experts.forward_modular(
-                x=hidden_states,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                shared_experts=self._shared_experts,
-                shared_experts_input=shared_experts_input,
-            )
+            # Let the active offloader tile the expert compute into residency
+            # "waves": it manages which experts are GPU-resident before each
+            # yield, and we sum the per-wave kernel outputs. Non-resident
+            # experts contribute exactly zero, so the sum equals the
+            # full-residency result. Shared experts run once (wave 0 only).
+            # For every backend other than expert_cache this yields once with
+            # unchanged behavior.
+            offloader = get_offloader()
+            fused_out = None
+            for wave_idx, _ in enumerate(
+                offloader.iter_expert_waves(self.routed_experts, topk_ids)
+            ):
+                wave_out = self.routed_experts.forward_modular(
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    shared_experts=self._shared_experts if wave_idx == 0 else None,
+                    shared_experts_input=(
+                        shared_experts_input if wave_idx == 0 else None
+                    ),
+                )
+                fused_out = wave_out if fused_out is None else fused_out.add_(wave_out)
 
         self._maybe_apply_shared_experts(
             shared_experts_input,

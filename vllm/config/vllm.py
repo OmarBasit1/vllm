@@ -958,6 +958,29 @@ class VllmConfig:
         if self.lora_config is not None:
             self.lora_config.verify_with_model_config(self.model_config)
 
+        expert_cache_selected = (
+            self.offload_config.offload_backend == "expert_cache"
+            or (
+                self.offload_config.offload_backend == "auto"
+                and self.offload_config.expert_cache.cache_capacity > 0
+            )
+        )
+        if (
+            expert_cache_selected
+            and self.model_config is not None
+            and not self.model_config.enforce_eager
+        ):
+            raise ValueError(
+                "offload_backend='expert_cache' requires --enforce-eager. "
+                "Its cache-miss resolution inspects actual routing decisions "
+                "(topk_ids values) at runtime to decide what to fetch/evict, "
+                "which is fundamentally incompatible with CUDA graph capture "
+                "(shape-only, no value-dependent host branching). This is not "
+                "silently forced on your behalf because it would change "
+                "requested compilation behavior for a niche backend; pass "
+                "--enforce-eager explicitly."
+            )
+
         if (
             self.mamba_config.enable_stochastic_rounding
             and self.cache_config.mamba_ssm_cache_dtype != "float16"

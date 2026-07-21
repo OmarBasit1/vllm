@@ -42,6 +42,7 @@ from vllm.config import (
     DiffusionConfig,
     ECTransferConfig,
     EPLBConfig,
+    ExpertCacheOffloadConfig,
     KernelConfig,
     KVEventsConfig,
     KVTransferConfig,
@@ -523,6 +524,19 @@ class EngineArgs:
     offload_num_in_group: int = PrefetchOffloadConfig.offload_num_in_group
     offload_prefetch_step: int = PrefetchOffloadConfig.offload_prefetch_step
     offload_params: set[str] = get_field(PrefetchOffloadConfig, "offload_params")
+    expert_cache_capacity: int = ExpertCacheOffloadConfig.cache_capacity
+    expert_cache_waves: int = ExpertCacheOffloadConfig.waves
+    expert_cache_max_transient_experts: int = (
+        ExpertCacheOffloadConfig.max_transient_experts
+    )
+    expert_cache_predict_k: int = ExpertCacheOffloadConfig.predict_k
+    expert_cache_prefetch_horizon: int = ExpertCacheOffloadConfig.prefetch_horizon
+    expert_cache_budget_gb: float = ExpertCacheOffloadConfig.budget_gb
+    expert_cache_eviction_policy: str = ExpertCacheOffloadConfig.eviction_policy
+    expert_cache_predictor: str = ExpertCacheOffloadConfig.predictor
+    expert_cache_params: set[str] = get_field(
+        ExpertCacheOffloadConfig, "offload_params"
+    )
     gpu_memory_utilization: float = CacheConfig.gpu_memory_utilization
     kv_cache_memory_bytes: int | None = CacheConfig.kv_cache_memory_bytes
     max_num_batched_tokens: int | None = None
@@ -1212,6 +1226,7 @@ class EngineArgs:
         offload_kwargs = get_kwargs(OffloadConfig)
         uva_kwargs = get_kwargs(UVAOffloadConfig)
         prefetch_kwargs = get_kwargs(PrefetchOffloadConfig)
+        expert_cache_kwargs = get_kwargs(ExpertCacheOffloadConfig)
         offload_group = parser.add_argument_group(
             title="OffloadConfig",
             description=OffloadConfig.__doc__,
@@ -1237,6 +1252,42 @@ class EngineArgs:
         )
         offload_group.add_argument(
             "--offload-params", **prefetch_kwargs["offload_params"]
+        )
+        offload_group.add_argument(
+            "--expert-cache-capacity",
+            **expert_cache_kwargs["cache_capacity"],
+        )
+        offload_group.add_argument(
+            "--expert-cache-waves",
+            **expert_cache_kwargs["waves"],
+        )
+        offload_group.add_argument(
+            "--expert-cache-max-transient-experts",
+            **expert_cache_kwargs["max_transient_experts"],
+        )
+        offload_group.add_argument(
+            "--expert-cache-predict-k",
+            **expert_cache_kwargs["predict_k"],
+        )
+        offload_group.add_argument(
+            "--expert-cache-prefetch-horizon",
+            **expert_cache_kwargs["prefetch_horizon"],
+        )
+        offload_group.add_argument(
+            "--expert-cache-budget-gb",
+            **expert_cache_kwargs["budget_gb"],
+        )
+        offload_group.add_argument(
+            "--expert-cache-eviction-policy",
+            **expert_cache_kwargs["eviction_policy"],
+        )
+        offload_group.add_argument(
+            "--expert-cache-predictor",
+            **expert_cache_kwargs["predictor"],
+        )
+        offload_group.add_argument(
+            "--expert-cache-params",
+            **expert_cache_kwargs["offload_params"],
         )
 
         # Multimodal related configs
@@ -2346,6 +2397,17 @@ class EngineArgs:
                 offload_num_in_group=self.offload_num_in_group,
                 offload_prefetch_step=self.offload_prefetch_step,
                 offload_params=self.offload_params,
+            ),
+            expert_cache=ExpertCacheOffloadConfig(
+                cache_capacity=self.expert_cache_capacity,
+                waves=self.expert_cache_waves,
+                max_transient_experts=self.expert_cache_max_transient_experts,
+                predict_k=self.expert_cache_predict_k,
+                prefetch_horizon=self.expert_cache_prefetch_horizon,
+                budget_gb=self.expert_cache_budget_gb,
+                eviction_policy=self.expert_cache_eviction_policy,
+                predictor=self.expert_cache_predictor,
+                offload_params=self.expert_cache_params,
             ),
         )
 

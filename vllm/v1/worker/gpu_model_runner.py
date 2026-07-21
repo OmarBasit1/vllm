@@ -5406,7 +5406,14 @@ class GPUModelRunner(
                     self.model, self.vllm_config, CUDAGraphMode.NONE, self.device
                 )
 
-        get_offloader().post_init()
+        offloader = get_offloader()
+        offloader.post_init()
+        # Offloaders that hold their own GPU-resident weight buffers allocate
+        # them in post_init(), i.e. after the DeviceMemoryProfiler above
+        # captured model_memory_usage. Fold that footprint in so KV-cache
+        # sizing (determine_available_memory) accounts for it and does not
+        # overcommit the GPU. No-op for offloaders that report 0.
+        self.model_memory_usage += offloader.resident_bytes()
 
     def _setup_eagle3_aux_hidden_state_outputs(self) -> None:
         if not self.use_aux_hidden_state_outputs:

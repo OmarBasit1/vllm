@@ -8,6 +8,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Generator
 from typing import TYPE_CHECKING
 
+import torch
 import torch.nn as nn
 
 import vllm.envs as envs
@@ -92,6 +93,34 @@ class BaseOffloader(ABC):
         """Start layer prefetch. Override in subclasses."""
         pass
 
+    def resident_bytes(self) -> int:
+        """GPU-resident weight bytes this offloader allocates in ``post_init``
+        (outside the model-loading memory profiler).
+
+        The model runner folds this into ``model_memory_usage`` so KV-cache
+        sizing accounts for it. Returns 0 by default (offloaders whose buffers
+        are already counted during model loading, or which use pageable/managed
+        memory). Override in subclasses that self-allocate large device
+        buffers after loading.
+        """
+        return 0
+
+    def iter_expert_waves(
+        self, routed_experts: nn.Module, topk_ids: torch.Tensor
+    ) -> Generator[None, None, None]:
+        """Yield once per residency "wave" the MoE kernel must run for this
+        step, managing GPU residency of ``routed_experts``' experts before each
+        yield.
+
+        The runner calls the fused-MoE kernel once per yield and sums the
+        outputs, so an offloader can tile a step's expert compute across
+        several passes when not all needed experts fit GPU memory at once.
+        The default yields exactly once with no residency management, so every
+        offloader other than the expert-cache one runs the kernel a single
+        time with unchanged behavior. Override in subclasses.
+        """
+        yield
+
 
 class NoopOffloader(BaseOffloader):
     """No-op offloader that returns modules as-is without any offloading."""
@@ -127,18 +156,23 @@ def create_offloader(offload_config: "OffloadConfig") -> BaseOffloader:
     """Create an offloader based on the offload configuration.
 
     Uses the explicit ``offload_backend`` selector.  When set to ``"auto"``,
-    selects prefetch if ``offload_group_size > 0``, UVA if
-    ``cpu_offload_gb > 0``, otherwise noop.
+    selects expert_cache if ``cache_capacity > 0``, else prefetch if
+    ``offload_group_size > 0``, else UVA if ``cpu_offload_gb > 0``, otherwise
+    noop.
     """
+    from vllm.model_executor.offloader.expert_cache import ExpertCacheOffloader
     from vllm.model_executor.offloader.prefetch import PrefetchOffloader
     from vllm.model_executor.offloader.uva import UVAOffloader
 
     backend = offload_config.offload_backend
     uva = offload_config.uva
     prefetch = offload_config.prefetch
+    expert_cache = offload_config.expert_cache
 
     if backend == "auto":
-        if prefetch.offload_group_size > 0:
+        if expert_cache.cache_capacity > 0:
+            backend = "expert_cache"
+        elif prefetch.offload_group_size > 0:
             backend = "prefetch"
         elif uva.cpu_offload_gb > 0:
             backend = "uva"
@@ -157,6 +191,17 @@ def create_offloader(offload_config: "OffloadConfig") -> BaseOffloader:
         return UVAOffloader(
             cpu_offload_max_bytes=int(uva.cpu_offload_gb * 1024**3),
             cpu_offload_params=uva.cpu_offload_params,
+        )
+    elif backend == "expert_cache":
+        return ExpertCacheOffloader(
+            pool_experts=expert_cache.cache_capacity,
+            waves=expert_cache.waves,
+            predict_k=expert_cache.predict_k,
+            prefetch_horizon=expert_cache.prefetch_horizon,
+            budget_gb=expert_cache.budget_gb,
+            eviction_policy=expert_cache.eviction_policy,
+            predictor=expert_cache.predictor,
+            offload_params=expert_cache.offload_params,
         )
     else:
         return NoopOffloader()
