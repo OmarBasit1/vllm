@@ -17,6 +17,7 @@
 # Usage:
 #   ./run_batch_sweep.sh sweep [cfg...]     # BATCH_GRID sweep (default below)
 #   BATCH_GRID="1 4 16" ./run_batch_sweep.sh sweep uva
+#   PREFILL_MODE=chunked ./run_batch_sweep.sh sweep uva prefetch expert_cache_w2
 set -uo pipefail
 
 ENV_BIN=${ENV_BIN:-/home/obasit/miniconda3/envs/vllm-moe-expert-cache/bin}
@@ -27,6 +28,18 @@ MODEL=Qwen/Qwen3-Coder-30B-A3B-Instruct
 PORT=8000
 NPROMPTS=${NPROMPTS:-50}
 BATCH_GRID=${BATCH_GRID:-"1 2 4 8 16 24 32"}
+# PREFILL_MODE=nonchunked (default, this directory's original fixed axis) or
+# =chunked (enables vLLM's default chunked-prefill scheduling instead).
+PREFILL_MODE=${PREFILL_MODE:-nonchunked}
+# Chunked-prefill's per-step chunk is bounded by this (it is also the KV-cache
+# sizing knob per the comment above, so it stays fixed across the batch axis
+# regardless of value chosen here).
+MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-8192}
+case "$PREFILL_MODE" in
+  nonchunked) CHUNKED_FLAG="--no-enable-chunked-prefill" ;;
+  chunked) CHUNKED_FLAG="--enable-chunked-prefill" ;;
+  *) echo "PREFILL_MODE must be 'chunked' or 'nonchunked', got '$PREFILL_MODE'"; exit 1 ;;
+esac
 mkdir -p "$EXP/results" "$EXP/logs" "$EXP/monitor"
 
 export HF_HOME=/export3/obasit/hf_home
@@ -42,10 +55,10 @@ CURL="env -u LD_LIBRARY_PATH curl"
 NUMACTL="$ENV_BIN/numactl --cpunodebind=1 --localalloc"
 
 # Fixed across every run: model, GPU memory budget, CPU-offload budget,
-# max-model-len, prefill mode (non-chunked). Only --max-num-seqs varies.
+# max-model-len, prefill mode ($PREFILL_MODE). Only --max-num-seqs varies.
 COMMON="$MODEL --max-model-len 8192 --gpu-memory-utilization 0.87 \
-  --no-enable-prefix-caching --no-enable-chunked-prefill \
-  --max-num-batched-tokens 8192 --port $PORT \
+  --no-enable-prefix-caching $CHUNKED_FLAG \
+  --max-num-batched-tokens $MAX_NUM_BATCHED_TOKENS --port $PORT \
   --compilation-config {\"fast_moe_cold_start\":false}"
 # --enforce-eager on every arm (not just expert_cache): expert_cache's
 # cache-miss resolution is inherently data-dependent (inspects actual
