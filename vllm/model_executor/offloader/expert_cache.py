@@ -31,6 +31,7 @@ is incompatible with CUDA graph capture. Reuses ``_CpuParamOffloader`` from
 ``prefetch.py`` for the CPU-pinned storage half of the offload.
 """
 
+import atexit
 import heapq
 from abc import ABC, abstractmethod
 from collections import deque
@@ -397,6 +398,20 @@ class ExpertCacheOffloader(BaseOffloader):
         self.prefetch_loaded = 0
         self.bytes_streamed = 0
 
+        # Per-bucket instrumentation: "prefill" = step contains at least one
+        # prefill token (mixed prefill+decode under continuous batching);
+        # "decode" = pure-decode step. hits/misses come from need (this
+        # layer-step); prefetch_loaded comes from prediction (not needed yet).
+        # `hits + misses` is every expert this step needed; `misses +
+        # prefetch_loaded` is every actual fetch (H2D load) issued, split by
+        # why it was issued.
+        self.bucket_stats: dict[str, dict[str, int]] = {
+            "prefill": {"hits": 0, "misses": 0, "prefetch_loaded": 0},
+            "decode": {"hits": 0, "misses": 0, "prefetch_loaded": 0},
+        }
+        self._pass_count = 0
+        self._STATS_LOG_INTERVAL = 50
+
     # -- module discovery (mirrors the prefetch/uva backends) --------------
     def wrap_modules(
         self,
@@ -520,6 +535,7 @@ class ExpertCacheOffloader(BaseOffloader):
         self._resident_bytes = cache.resident_bytes()
         self._calibrate_pcie(per_expert_bytes)
         self._log_and_check_budget(global_num_experts, per_expert_bytes)
+        atexit.register(self._log_final_stats)
 
     def _warm_always_on(self) -> None:
         """Pin architecturally always-activated routed experts (empty on a
@@ -672,21 +688,23 @@ class ExpertCacheOffloader(BaseOffloader):
         self._consume_timing(layer)
 
         cur_idx = self._layer_index[layer]
+        bucket = self._batch_bucket(topk_ids)
+        num_tokens = topk_ids.shape[0]
+
         needed = torch.unique(topk_ids).tolist()
         resident = {g for g in needed if cache.is_resident(layer, g)}
         hits, misses = split_hits_misses(resident, needed)
         cache.bump(layer, needed)
         self.hot_hits += len(hits)
         self.cold_streamed += len(misses)
+        self.bucket_stats[bucket]["hits"] += len(hits)
+        self.bucket_stats[bucket]["misses"] += len(misses)
 
         # Reserve the whole current-iteration working set before any eviction.
         cache.pin_step({(layer, g) for g in needed})
         horizon = self._horizon_keys(cur_idx)
         miss_event = cache.load([(layer, g) for g in misses], horizon)
         self.bytes_streamed += len(misses) * cache.per_expert_bytes
-
-        bucket = self._batch_bucket(topk_ids)
-        num_tokens = topk_ids.shape[0]
 
         start_ev = end_ev = None
         if cuda:
@@ -719,6 +737,7 @@ class ExpertCacheOffloader(BaseOffloader):
 
         self._issue_prefetch(cur_idx, bucket, num_tokens, len(misses), horizon)
         cache.unpin_step()
+        self._maybe_log_stats(cur_idx)
 
     def _issue_prefetch(
         self,
@@ -751,11 +770,24 @@ class ExpertCacheOffloader(BaseOffloader):
             return
         ev = self._cache.load(batch, horizon)
         self.prefetch_loaded += len(batch)
+        self.bucket_stats[bucket]["prefetch_loaded"] += len(batch)
         self.bytes_streamed += len(batch) * self._cache.per_expert_bytes
         if ev is not None:
             self._prev_prefetch_event = ev
 
-    def get_stats(self) -> dict[str, float]:
+    def _bucket_metrics(self, bucket: str) -> dict[str, float]:
+        s = self.bucket_stats[bucket]
+        needed = s["hits"] + s["misses"]
+        fetches = s["misses"] + s["prefetch_loaded"]
+        return {
+            "hits": s["hits"],
+            "misses": s["misses"],
+            "prefetch_loaded": s["prefetch_loaded"],
+            "hit_rate": s["hits"] / needed if needed else 0.0,
+            "prefetch_ratio": s["prefetch_loaded"] / fetches if fetches else 0.0,
+        }
+
+    def get_stats(self) -> dict:
         return {
             "hot_hits": self.hot_hits,
             "cold_streamed": self.cold_streamed,
@@ -767,4 +799,38 @@ class ExpertCacheOffloader(BaseOffloader):
                 if (self.hot_hits + self.cold_streamed)
                 else 0.0
             ),
+            "prefill": self._bucket_metrics("prefill"),
+            "decode": self._bucket_metrics("decode"),
         }
+
+    def _maybe_log_stats(self, cur_idx: int) -> None:
+        """Emit a periodic stats line once per forward pass (layer 0 marks a new
+        pass), so a long benchmark run's log has a running trail of bucketed
+        hit-rate / prefetch-ratio without waiting for shutdown."""
+        if cur_idx != 0:
+            return
+        self._pass_count += 1
+        if self._pass_count % self._STATS_LOG_INTERVAL == 0:
+            self._log_stats_line()
+
+    def _log_stats_line(self) -> None:
+        pf, dc = self._bucket_metrics("prefill"), self._bucket_metrics("decode")
+        logger.info(
+            "[ExpertCacheOffloader] stats (pass=%d) "
+            "prefill+decode: hits=%d misses=%d prefetch=%d hit_rate=%.3f "
+            "prefetch_ratio=%.3f | decode: hits=%d misses=%d prefetch=%d "
+            "hit_rate=%.3f prefetch_ratio=%.3f",
+            self._pass_count,
+            pf["hits"], pf["misses"], pf["prefetch_loaded"],
+            pf["hit_rate"], pf["prefetch_ratio"],
+            dc["hits"], dc["misses"], dc["prefetch_loaded"],
+            dc["hit_rate"], dc["prefetch_ratio"],
+        )
+
+    def _log_final_stats(self) -> None:
+        # Registered via atexit; never let shutdown-time logging raise.
+        try:
+            logger.info("[ExpertCacheOffloader] final stats:")
+            self._log_stats_line()
+        except Exception:
+            pass

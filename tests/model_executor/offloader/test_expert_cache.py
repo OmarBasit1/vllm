@@ -338,6 +338,64 @@ def test_prefetch_skips_already_resident_and_loads_predicted():
 
 
 # ---------------------------------------------------------------------------
+# Tier A: bucketed hit-rate / prefetch-ratio instrumentation
+# ---------------------------------------------------------------------------
+
+
+def test_bucketed_hits_misses_land_in_correct_bucket():
+    off, cache, mods = _wire(E=8, pool_experts=8, waves=1)
+    cache.load([("layer.0", 0)], horizon=set())  # pre-resident hit
+    # decode step: single token, needs {0 (hit), 1 (miss)}.
+    list(off.iter_expert_waves(mods[0], torch.tensor([[0, 1]], device=DEVICE)))
+    assert off.bucket_stats["decode"] == {"hits": 1, "misses": 1, "prefetch_loaded": 0}
+    assert off.bucket_stats["prefill"] == {"hits": 0, "misses": 0, "prefetch_loaded": 0}
+    # prefill step (many tokens): needs {2,3,4} (all misses).
+    list(
+        off.iter_expert_waves(
+            mods[0], torch.tensor([[2], [3], [4]] * 8, device=DEVICE)
+        )
+    )
+    assert off.bucket_stats["prefill"]["misses"] == 3
+    assert off.bucket_stats["decode"] == {"hits": 1, "misses": 1, "prefetch_loaded": 0}
+
+
+def test_get_stats_bucket_hit_rate_and_prefetch_ratio():
+    off, cache, mods = _wire(E=8, pool_experts=8, waves=1)
+    off.bucket_stats["prefill"] = {"hits": 3, "misses": 1, "prefetch_loaded": 4}
+    stats = off.get_stats()
+    pf = stats["prefill"]
+    assert pf["hit_rate"] == pytest.approx(3 / 4)  # 3 hits / (3 hits + 1 miss)
+    assert pf["prefetch_ratio"] == pytest.approx(4 / 5)  # 4 prefetch / (1 miss + 4 prefetch)
+    assert stats["decode"]["hit_rate"] == 0.0  # no traffic yet -> 0, not NaN/error
+
+
+def test_prefetch_loaded_bucketed_by_triggering_step():
+    off, cache, mods = _wire(
+        num_layers=2, E=8, pool_experts=8, waves=1, predict_k=3, prefetch_horizon=1
+    )
+    off._t_per_expert_ms = 0.001
+    off._layer_time_ema["prefill"] = 1.0
+    # A 32-token step (bucketed "prefill" by the no-forward-context heuristic)
+    # triggers the prefetch; the loaded experts must be attributed to "prefill".
+    list(off.iter_expert_waves(mods[0], torch.zeros(32, 2, dtype=torch.long, device=DEVICE)))
+    assert off.bucket_stats["prefill"]["prefetch_loaded"] == off.prefetch_loaded
+    assert off.bucket_stats["decode"]["prefetch_loaded"] == 0
+
+
+def test_periodic_stats_log_fires_only_on_layer_zero_at_interval(monkeypatch):
+    off, cache, mods = _wire(num_layers=3, E=8, pool_experts=8, waves=1)
+    off._STATS_LOG_INTERVAL = 2
+    calls = []
+    monkeypatch.setattr(off, "_log_stats_line", lambda: calls.append(off._pass_count))
+    topk = torch.tensor([[0, 1]], device=DEVICE)
+    for _ in range(2):  # two full passes over all 3 layers
+        for m in mods:
+            list(off.iter_expert_waves(m, topk))
+    assert off._pass_count == 2  # only layer-0 calls increment the pass counter
+    assert calls == [2]  # logged once, at pass 2 (the interval)
+
+
+# ---------------------------------------------------------------------------
 # Tier B: numerical equality via the real cache.publish path (CUDA)
 # ---------------------------------------------------------------------------
 
