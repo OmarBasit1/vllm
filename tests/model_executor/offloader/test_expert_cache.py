@@ -14,6 +14,7 @@ Two tiers:
   exactly, for both waves=1 and waves=2.
 """
 
+import numpy as np
 import pytest
 import torch
 import torch.nn as nn
@@ -23,12 +24,14 @@ from vllm.model_executor.offloader.expert_cache import (
     EvictionPolicy,
     ExpertCacheOffloader,
     ExpertPredictor,
+    HybridExpertPredictor,
     LFUEviction,
     _GlobalExpertCache,
     create_eviction,
     create_predictor,
     split_hits_misses,
 )
+from vllm.model_executor.offloader.expert_predictor_mlp import ExpertPredictorMLP
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 requires_cuda = pytest.mark.skipif(
@@ -171,6 +174,181 @@ def test_eviction_registry_and_rejects_unknown_policy():
         create_eviction("mru")
     with pytest.raises(ValueError, match="waves must be 1 or 2"):
         ExpertCacheOffloader(pool_experts=8, waves=3)
+
+
+# ---------------------------------------------------------------------------
+# Tier A: hybrid predictor (Markov marginal cold-start + per-layer MLP)
+# ---------------------------------------------------------------------------
+
+
+def _write_hybrid_artifacts(
+    tmp_path, num_layers: int = 3, num_experts: int = 8, hidden_dim: int = 4
+) -> str:
+    """Write a tiny markov_table.npz + one MLP checkpoint (layer 1 only),
+    matching the on-disk contract `HybridExpertPredictor` expects: `<dir>/
+    markov_table.npz` and `<dir>/mlp_ckpts/raw_hidden/layer_{L:02d}/
+    best_model.pt`. Each layer's marginal is a distinct ascending ramp so its
+    top-k is deterministic without relying on argsort tie-breaking: layer L's
+    top-k is always [num_experts-1, num_experts-2, ...]."""
+    marginal = np.stack(
+        [np.arange(num_experts) for _ in range(num_layers)]
+    ).astype(np.int64)
+    np.savez_compressed(
+        tmp_path / "markov_table.npz",
+        counts=np.zeros((num_layers, num_experts, num_experts), dtype=np.int64),
+        marginal=marginal,
+        num_layers=num_layers,
+        num_experts=num_experts,
+        topk=8,
+    )
+    ckpt_dir = tmp_path / "mlp_ckpts" / "raw_hidden" / "layer_01"
+    ckpt_dir.mkdir(parents=True)
+    mlp = ExpertPredictorMLP(hidden_dim, h1=16, h2=8, num_experts=num_experts)
+    torch.save(
+        {
+            "input_dim": hidden_dim,
+            "h1": 16,
+            "h2": 8,
+            "num_experts": num_experts,
+            "dropout": 0.0,
+            "state_dict": mlp.state_dict(),
+        },
+        ckpt_dir / "best_model.pt",
+    )
+    return str(tmp_path)
+
+
+def test_hybrid_predictor_requires_artifacts_dir():
+    with pytest.raises(ValueError, match="expert-cache-predictor-artifacts"):
+        create_predictor("hybrid")
+
+
+def test_hybrid_predictor_missing_markov_table_raises(tmp_path):
+    with pytest.raises(FileNotFoundError, match="markov_table.npz"):
+        create_predictor("hybrid", artifacts_dir=str(tmp_path))
+
+
+def test_hybrid_predictor_missing_checkpoints_raises(tmp_path):
+    np.savez_compressed(
+        tmp_path / "markov_table.npz",
+        counts=np.zeros((1, 8, 8), dtype=np.int64),
+        marginal=np.zeros((1, 8), dtype=np.int64),
+        num_layers=1,
+        num_experts=8,
+        topk=8,
+    )
+    with pytest.raises(FileNotFoundError, match="no checkpoints found"):
+        create_predictor("hybrid", artifacts_dir=str(tmp_path))
+
+
+def test_hybrid_predictor_layer0_is_marginal(tmp_path):
+    artifacts_dir = _write_hybrid_artifacts(tmp_path, num_experts=8)
+    predictor = create_predictor("hybrid", artifacts_dir=artifacts_dir)
+    assert predictor.predict(0, k=3) == [7, 6, 5]
+
+
+def test_hybrid_predictor_falls_back_to_marginal_without_observe(tmp_path):
+    artifacts_dir = _write_hybrid_artifacts(tmp_path, num_experts=8)
+    predictor = create_predictor("hybrid", artifacts_dir=artifacts_dir)
+    # layer 1 has an MLP, but predict(1) before any observe() has no cached
+    # hidden for layer 0 -> falls back to layer 1's own marginal.
+    assert predictor.predict(1, k=2) == [7, 6]
+
+
+def test_hybrid_predictor_unchecked_layer_falls_back_to_marginal(tmp_path):
+    # layer 2 has no MLP checkpoint at all -> always the marginal fallback.
+    artifacts_dir = _write_hybrid_artifacts(tmp_path, num_layers=3, num_experts=8)
+    predictor = create_predictor("hybrid", artifacts_dir=artifacts_dir)
+    assert predictor.predict(2, k=2) == [7, 6]
+
+
+def test_hybrid_predictor_observe_then_predict_runs_mlp(tmp_path):
+    artifacts_dir = _write_hybrid_artifacts(tmp_path, num_experts=8, hidden_dim=4)
+    predictor = create_predictor("hybrid", artifacts_dir=artifacts_dir)
+    hidden = torch.randn(5, 4, device=DEVICE)  # 5-token step
+    predictor.observe(
+        layer_idx=0,
+        topk_ids=torch.zeros(5, 1, dtype=torch.long, device=DEVICE),
+        hidden_states=hidden,
+    )
+    top2 = predictor.predict(1, k=2)
+    assert len(top2) == 2
+    assert all(0 <= g < 8 for g in top2)
+    # MLP was moved to the observed hidden's device (lazy placement).
+    assert next(predictor._mlps[1].parameters()).device == hidden.device
+
+
+def test_hybrid_predictor_aggregates_across_step_tokens(tmp_path, monkeypatch):
+    artifacts_dir = _write_hybrid_artifacts(tmp_path, num_layers=2, num_experts=4, hidden_dim=2)
+    predictor = create_predictor("hybrid", artifacts_dir=artifacts_dir)
+
+    # Force per-token distributions to disagree, so a correct aggregation
+    # (summed across tokens) is required to recover both preferred experts --
+    # this would fail if predict() only looked at one token's row.
+    def fake_forward(x):
+        n = x.shape[0]
+        out = torch.zeros(n, 4)
+        out[0, 0] = 10.0  # token 0 strongly prefers expert 0
+        out[1:, 1] = 10.0  # every other token strongly prefers expert 1
+        return out
+
+    monkeypatch.setattr(predictor._mlps[1], "forward", fake_forward)
+    hidden = torch.zeros(5, 2)
+    predictor.observe(
+        layer_idx=0, topk_ids=torch.zeros(5, 1, dtype=torch.long), hidden_states=hidden
+    )
+    assert set(predictor.predict(1, k=2)) == {0, 1}
+
+
+def test_hybrid_predictor_only_caches_latest_layer_observation(tmp_path):
+    artifacts_dir = _write_hybrid_artifacts(tmp_path)
+    predictor = create_predictor("hybrid", artifacts_dir=artifacts_dir)
+    predictor.observe(
+        layer_idx=0,
+        topk_ids=torch.zeros(3, 1, dtype=torch.long),
+        hidden_states=torch.randn(3, 4),
+    )
+    predictor.observe(
+        layer_idx=5,
+        topk_ids=torch.zeros(3, 1, dtype=torch.long),
+        hidden_states=torch.randn(3, 4),
+    )
+    # Bounded memory: only the most recent observation is retained regardless
+    # of prefetch_horizon.
+    assert set(predictor._hidden.keys()) == {5}
+
+
+def test_hybrid_predictor_mlp_not_among_routed_experts(tmp_path):
+    """Structural guard for "keep the predictor MLP resident, never
+    offloaded": the MLP module must never be one of the modules the cache
+    wraps for CPU-pinned offload/eviction (`_routed_experts`), since only
+    those are touched by `_wrap_routed_experts`/`_CpuParamOffloader`."""
+    artifacts_dir = _write_hybrid_artifacts(tmp_path)
+    off, cache, mods = _wire(num_layers=2, E=8, pool_experts=8, waves=1)
+    off.predictor = create_predictor("hybrid", artifacts_dir=artifacts_dir)
+    hidden = torch.randn(2, 4, device=DEVICE)
+    list(off.iter_expert_waves(mods[0], torch.tensor([[0, 1]], device=DEVICE), hidden))
+    assert isinstance(off.predictor, HybridExpertPredictor)
+    mlp = off.predictor._mlps[1]
+    assert mlp not in off._routed_experts.values()
+    assert next(mlp.parameters()).device.type == DEVICE.type  # moved via observe()
+
+
+def test_iter_expert_waves_calls_observe_before_horizon(tmp_path):
+    """`observe` must run before `_horizon_keys` reads the cached hidden for
+    the very same step, otherwise predict(cur_idx+1) sees stale/no data."""
+    artifacts_dir = _write_hybrid_artifacts(
+        tmp_path, num_layers=2, num_experts=8, hidden_dim=4
+    )
+    off, cache, mods = _wire(
+        num_layers=2, E=8, pool_experts=8, waves=1, prefetch_horizon=1
+    )
+    off.predictor = create_predictor("hybrid", artifacts_dir=artifacts_dir)
+    hidden = torch.randn(2, 4, device=DEVICE)
+    list(off.iter_expert_waves(mods[0], torch.tensor([[0, 1]], device=DEVICE), hidden))
+    # observe(0, ..., hidden) ran, so predict(1) used the MLP, not the
+    # layer-1 marginal fallback -> _hidden actually got populated for layer 0.
+    assert 0 in off.predictor._hidden
 
 
 def test_lfu_rank_orders_nonhorizon_low_freq_first():
@@ -319,7 +497,34 @@ def test_horizon_keys_only_upcoming_layers():
     off, _, _ = _wire(num_layers=4, predict_k=2, prefetch_horizon=2)
     keys = off._horizon_keys(cur_idx=1)  # layers 2,3
     assert keys == {("layer.2", 0), ("layer.2", 1), ("layer.3", 0), ("layer.3", 1)}
-    assert off._horizon_keys(cur_idx=3) == set()  # last layer: nothing ahead
+    # Cyclic: the last layer's horizon wraps into the *next* forward pass's
+    # early layers (decode runs layer N-1 then layer 0 back-to-back, so this
+    # is a real prefetch opportunity, not a bug).
+    assert off._horizon_keys(cur_idx=3) == {
+        ("layer.0", 0),
+        ("layer.0", 1),
+        ("layer.1", 0),
+        ("layer.1", 1),
+    }
+
+
+def test_horizon_keys_wraps_cyclically_from_last_layer():
+    off, _, _ = _wire(num_layers=3, predict_k=1, prefetch_horizon=1)
+    # cur_idx=2 is the last layer; horizon of 1 wraps to layer 0 of the next pass.
+    assert off._horizon_keys(cur_idx=2) == {("layer.0", 0)}
+
+
+def test_horizon_keys_caps_at_num_layers_minus_one_never_revisits_cur_idx():
+    off, _, _ = _wire(num_layers=3, predict_k=1, prefetch_horizon=10)
+    # prefetch_horizon (10) far exceeds num_layers-1 (2); must cap rather than
+    # wrap all the way back around to predicting cur_idx itself.
+    assert off._upcoming_layers(cur_idx=0) == [1, 2]
+    assert off._horizon_keys(cur_idx=0) == {("layer.1", 0), ("layer.2", 0)}
+
+
+def test_upcoming_layers_empty_for_single_layer_model():
+    off, _, _ = _wire(num_layers=1, predict_k=1, prefetch_horizon=1)
+    assert off._upcoming_layers(cur_idx=0) == []
 
 
 def test_prefetch_skips_already_resident_and_loads_predicted():

@@ -588,7 +588,9 @@ class MoERunner(MoERunnerInterface):
             offloader = get_offloader()
             fused_out = None
             for wave_idx, _ in enumerate(
-                offloader.iter_expert_waves(self.routed_experts, topk_ids)
+                offloader.iter_expert_waves(
+                    self.routed_experts, topk_ids, hidden_states
+                )
             ):
                 wave_out = self.routed_experts.forward_modular(
                     x=hidden_states,

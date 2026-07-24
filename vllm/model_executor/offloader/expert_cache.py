@@ -36,12 +36,15 @@ import heapq
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Generator
+from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 
 from vllm.logger import init_logger
 from vllm.model_executor.offloader.base import BaseOffloader
+from vllm.model_executor.offloader.expert_predictor_mlp import ExpertPredictorMLP
 from vllm.model_executor.offloader.prefetch import _CpuParamOffloader
 
 logger = init_logger(__name__)
@@ -58,6 +61,21 @@ class ExpertPredictor(ABC):
         """Return up to k predicted global expert ids for the given layer."""
         raise NotImplementedError
 
+    def observe(
+        self,
+        layer_idx: int,
+        topk_ids: torch.Tensor,
+        hidden_states: torch.Tensor | None = None,
+    ) -> None:  # noqa: B027
+        """Record this step's routing/hidden-state signal for ``layer_idx``.
+
+        Called once per (layer, step) from ``iter_expert_waves``, before
+        ``predict`` is queried for any upcoming layer. Default no-op; override
+        in predictors that condition on runtime signal (e.g.
+        ``HybridExpertPredictor``).
+        """
+        return
+
 
 class DummyFirstKPredictor(ExpertPredictor):
     """Static predictor: always predicts global expert ids 0..k-1.
@@ -71,17 +89,129 @@ class DummyFirstKPredictor(ExpertPredictor):
         return list(range(k))
 
 
+class HybridExpertPredictor(ExpertPredictor):
+    """Per-layer MLP (lookahead=1) with an unconditional-frequency fallback.
+
+    For layer ``L``, ``predict(L, k)`` runs a per-layer ``ExpertPredictorMLP``
+    on the layer-``(L-1)`` hidden state cached by the most recent
+    ``observe(L-1, ...)`` call, aggregating the predicted per-token
+    distributions across the step's tokens (summed probability mass) before
+    taking the top-k -- a step's true "needed" set is the union of every
+    token's routed experts, not any single token's. Runs unconditionally: no
+    confidence gate, no fallback to a second predictor past this class.
+
+    Falls back to that layer's marginal (unconditional expert-routing
+    frequency, from the Markov table's cold-start column) whenever no
+    layer-(L-1) hidden has been observed yet for this step -- always true for
+    layer 0 (no predecessor exists), and also true for any layer beyond the
+    1-hop lookahead the MLP was trained for if ``prefetch_horizon`` is
+    configured deeper than 1.
+
+    Loads all artifacts from ``artifacts_dir`` (see
+    ``ExpertCacheOffloadConfig.predictor_artifacts``); MLP weights are moved
+    to the compute device lazily, on the first ``observe`` call, since the
+    device is not yet known at construction time (layer/device discovery in
+    ``ExpertCacheOffloader`` happens after the predictor is created). The
+    MLPs are owned only by this predictor -- never registered as
+    ``routed_experts`` or listed in ``offload_params`` -- so neither the
+    expert-cache pool nor ``--cpu-offload-gb`` can page them out; they stay
+    GPU-resident for the life of the process.
+    """
+
+    def __init__(self, artifacts_dir: str) -> None:
+        if not artifacts_dir:
+            raise ValueError(
+                "predictor='hybrid' requires --expert-cache-predictor-artifacts "
+                "to point at a directory with markov_table.npz and "
+                "mlp_ckpts/raw_hidden/layer_{L:02d}/best_model.pt checkpoints."
+            )
+        artifacts = Path(artifacts_dir)
+        markov_path = artifacts / "markov_table.npz"
+        if not markov_path.exists():
+            raise FileNotFoundError(
+                f"expert-cache hybrid predictor: {markov_path} not found"
+            )
+        markov = np.load(markov_path)
+        self._marginal: np.ndarray = markov["marginal"]  # (num_layers, num_experts)
+
+        self._mlps: dict[int, ExpertPredictorMLP] = {}
+        ckpt_root = artifacts / "mlp_ckpts" / "raw_hidden"
+        for layer_dir in sorted(ckpt_root.glob("layer_*")):
+            ckpt_path = layer_dir / "best_model.pt"
+            if not ckpt_path.exists():
+                continue
+            layer = int(layer_dir.name.split("_")[1])
+            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            mlp = ExpertPredictorMLP(
+                ckpt["input_dim"], ckpt["h1"], ckpt["h2"], ckpt["num_experts"]
+            )
+            mlp.load_state_dict(ckpt["state_dict"])
+            mlp.eval()
+            for p in mlp.parameters():
+                p.requires_grad_(False)
+            self._mlps[layer] = mlp
+        if not self._mlps:
+            raise FileNotFoundError(
+                f"expert-cache hybrid predictor: no checkpoints found under {ckpt_root}"
+            )
+
+        self._device: torch.device | None = None
+        self._hidden: dict[int, torch.Tensor] = {}
+
+    def _ensure_device(self, device: torch.device) -> None:
+        if self._device == device:
+            return
+        for mlp in self._mlps.values():
+            mlp.to(device)
+        self._device = device
+
+    def observe(
+        self,
+        layer_idx: int,
+        topk_ids: torch.Tensor,
+        hidden_states: torch.Tensor | None = None,
+    ) -> None:
+        if hidden_states is None:
+            return
+        self._ensure_device(hidden_states.device)
+        # Only the immediately-next layer's predict() needs this; a single
+        # entry bounds memory regardless of prefetch_horizon.
+        self._hidden = {layer_idx: hidden_states}
+
+    def _marginal_topk(self, layer_idx: int, k: int) -> list[int]:
+        layer_idx = min(layer_idx, self._marginal.shape[0] - 1)
+        row = self._marginal[layer_idx]
+        k = min(k, row.shape[0])
+        return np.argsort(-row)[:k].tolist()
+
+    def predict(self, layer_idx: int, k: int) -> list[int]:
+        if layer_idx == 0:
+            return self._marginal_topk(0, k)
+        mlp = self._mlps.get(layer_idx)
+        hidden = self._hidden.get(layer_idx - 1)
+        if mlp is None or hidden is None:
+            return self._marginal_topk(layer_idx, k)
+        with torch.no_grad():
+            probs = torch.softmax(mlp(hidden.to(torch.float32)), dim=-1)
+            agg = probs.sum(dim=0)
+        k = min(k, agg.shape[-1])
+        return torch.topk(agg, k).indices.tolist()
+
+
 _PREDICTOR_REGISTRY: dict[str, type[ExpertPredictor]] = {
     "first_k": DummyFirstKPredictor,
+    "hybrid": HybridExpertPredictor,
 }
 
 
-def create_predictor(name: str) -> ExpertPredictor:
+def create_predictor(name: str, artifacts_dir: str = "") -> ExpertPredictor:
     if name not in _PREDICTOR_REGISTRY:
         raise ValueError(
             f"Unknown expert-cache predictor {name!r}. "
             f"Available: {sorted(_PREDICTOR_REGISTRY)}"
         )
+    if name == "hybrid":
+        return HybridExpertPredictor(artifacts_dir)
     return _PREDICTOR_REGISTRY[name]()
 
 
@@ -362,6 +492,7 @@ class ExpertCacheOffloader(BaseOffloader):
         budget_gb: float = 0.0,
         eviction_policy: str = "lfu",
         predictor: str = "first_k",
+        predictor_artifacts: str = "",
         offload_params: set[str] | None = None,
     ):
         if waves not in (1, 2):
@@ -371,7 +502,7 @@ class ExpertCacheOffloader(BaseOffloader):
         self.predict_k = predict_k
         self.prefetch_horizon = max(0, prefetch_horizon)
         self.budget_gb = budget_gb
-        self.predictor = create_predictor(predictor)
+        self.predictor = create_predictor(predictor, artifacts_dir=predictor_artifacts)
         self.eviction = create_eviction(eviction_policy)
         self.offload_params = offload_params or set()
 
@@ -633,11 +764,21 @@ class ExpertCacheOffloader(BaseOffloader):
             pass
         return "decode" if num_tokens <= 1 else "prefill"
 
+    def _upcoming_layers(self, cur_idx: int) -> list[int]:
+        """Layer indices to predict for, up to `prefetch_horizon` steps ahead
+        of `cur_idx`, treating layer order as cyclic: the last layer's wave
+        can predict the *next* forward pass's early layers, since decode runs
+        layers `0..N-1` back-to-back across consecutive token steps with no
+        gap between the last layer of one step and the first of the next.
+        Capped at `N-1` steps so it never wraps back around to `cur_idx`
+        itself (and returns nothing for a single-layer model)."""
+        n = len(self._layer_order)
+        horizon = min(self.prefetch_horizon, max(0, n - 1))
+        return [(cur_idx + offset) % n for offset in range(1, horizon + 1)]
+
     def _horizon_keys(self, cur_idx: int) -> set[Key]:
         keys: set[Key] = set()
-        for tl in range(
-            cur_idx + 1, min(cur_idx + 1 + self.prefetch_horizon, len(self._layer_order))
-        ):
+        for tl in self._upcoming_layers(cur_idx):
             lname = self._layer_order[tl]
             for g in self.predictor.predict(tl, self.predict_k):
                 keys.add((lname, g))
@@ -673,7 +814,10 @@ class ExpertCacheOffloader(BaseOffloader):
         )
 
     def iter_expert_waves(
-        self, routed_experts: nn.Module, topk_ids: torch.Tensor
+        self,
+        routed_experts: nn.Module,
+        topk_ids: torch.Tensor,
+        hidden_states: torch.Tensor | None = None,
     ) -> Generator[None, None, None]:
         cache = self._cache
         layer = routed_experts.layer_name
@@ -699,6 +843,8 @@ class ExpertCacheOffloader(BaseOffloader):
         self.cold_streamed += len(misses)
         self.bucket_stats[bucket]["hits"] += len(hits)
         self.bucket_stats[bucket]["misses"] += len(misses)
+
+        self.predictor.observe(cur_idx, topk_ids, hidden_states)
 
         # Reserve the whole current-iteration working set before any eviction.
         cache.pin_step({(layer, g) for g in needed})
@@ -753,10 +899,10 @@ class ExpertCacheOffloader(BaseOffloader):
             return
         # Candidate queue: predicted experts for upcoming layers only (entries for
         # the current or past layers are stale by construction and never enqueued).
+        # Cyclic: near the end of a pass this reaches into the next pass's
+        # early layers -- see `_upcoming_layers`.
         queue: deque[Key] = deque()
-        for tl in range(
-            cur_idx + 1, min(cur_idx + 1 + self.prefetch_horizon, len(self._layer_order))
-        ):
+        for tl in self._upcoming_layers(cur_idx):
             lname = self._layer_order[tl]
             for g in self.predictor.predict(tl, self.predict_k):
                 queue.append((lname, g))

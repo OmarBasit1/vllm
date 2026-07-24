@@ -106,7 +106,10 @@ class BaseOffloader(ABC):
         return 0
 
     def iter_expert_waves(
-        self, routed_experts: nn.Module, topk_ids: torch.Tensor
+        self,
+        routed_experts: nn.Module,
+        topk_ids: torch.Tensor,
+        hidden_states: torch.Tensor | None = None,
     ) -> Generator[None, None, None]:
         """Yield once per residency "wave" the MoE kernel must run for this
         step, managing GPU residency of ``routed_experts``' experts before each
@@ -118,6 +121,10 @@ class BaseOffloader(ABC):
         The default yields exactly once with no residency management, so every
         offloader other than the expert-cache one runs the kernel a single
         time with unchanged behavior. Override in subclasses.
+
+        ``hidden_states`` is the layer's pre-router hidden state, passed
+        through for predictors that condition on it (e.g. the expert-cache's
+        "hybrid" predictor); unused by the default no-op implementation.
         """
         yield
 
@@ -201,6 +208,7 @@ def create_offloader(offload_config: "OffloadConfig") -> BaseOffloader:
             budget_gb=expert_cache.budget_gb,
             eviction_policy=expert_cache.eviction_policy,
             predictor=expert_cache.predictor,
+            predictor_artifacts=expert_cache.predictor_artifacts,
             offload_params=expert_cache.offload_params,
         )
     else:

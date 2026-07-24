@@ -128,9 +128,19 @@ class ExpertCacheOffloadConfig:
     predicted-soon experts are evicted only as a last resort)."""
 
     predictor: str = "first_k"
-    """Predictor identifier. "first_k" (the only one shipped) statically
-    predicts global expert ids 0..predict_k-1 for every layer and request,
-    with no router-logit awareness."""
+    """Predictor identifier. "first_k" statically predicts global expert ids
+    0..predict_k-1 for every layer and request, with no router-logit
+    awareness. "hybrid" predicts layer L's experts from an MLP conditioned on
+    layer L-1's hidden state (see `predictor_artifacts`), falling back to a
+    per-layer unconditional expert-frequency marginal wherever no L-1 hidden
+    has been observed yet (layer 0, or a layer beyond the 1-hop lookahead the
+    MLP was trained for)."""
+
+    predictor_artifacts: str = ""
+    """Directory of trained predictor artifacts, required when `predictor`
+    is "hybrid". Expects `<dir>/markov_table.npz` (per-layer expert-frequency
+    marginals) and `<dir>/mlp_ckpts/raw_hidden/layer_{L:02d}/best_model.pt`
+    for each layer L with a trained MLP. Ignored by "first_k"."""
 
     offload_params: set[str] = Field(default_factory=set)
     """The set of parameter name segments to target for expert caching.
