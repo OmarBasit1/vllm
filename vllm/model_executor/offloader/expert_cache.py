@@ -399,6 +399,18 @@ class _GlobalExpertCache:
 
         self._copy_stream: torch.cuda.Stream | None = None
 
+        # Real (live-measured) transfer-time accumulation, for comparing
+        # against the once-at-startup PCIe calibration (`_t_per_expert_ms`) --
+        # see `ExpertCacheOffloader._calibrate_pcie`. A FIFO, drained
+        # opportunistically (never discarded -- CUDA events on the same
+        # stream complete in program order, so checking only the oldest
+        # entry is sufficient and correct).
+        self._transfer_timing_pending: deque[
+            tuple[int, torch.cuda.Event, torch.cuda.Event]
+        ] = deque()
+        self.real_transfer_ms_sum = 0.0
+        self.real_transfer_expert_count = 0
+
     # -- setup -------------------------------------------------------------
     def register_layer(
         self,
@@ -508,13 +520,31 @@ class _GlobalExpertCache:
             fork = torch.cuda.Event()
             torch.cuda.current_stream().record_event(fork)
             self._copy_stream.wait_event(fork)
+            xfer_start = torch.cuda.Event(enable_timing=True)
+            xfer_start.record(self._copy_stream)
             with torch.cuda.stream(self._copy_stream):
                 self._copy_into(to_load, free)
-            ev = torch.cuda.Event()
+            ev = torch.cuda.Event(enable_timing=True)
             ev.record(self._copy_stream)
+            self._transfer_timing_pending.append((len(to_load), xfer_start, ev))
             return ev
         self._copy_into(to_load, free)
         return None
+
+    def drain_transfer_timing(self) -> None:
+        """Accumulate real (live-measured) H2D transfer time for completed
+        loads into `real_transfer_ms_sum`/`real_transfer_expert_count`, for
+        comparison against the once-at-startup PCIe calibration. Events on
+        the copy stream complete in program order, so checking only the
+        oldest pending entry is sufficient -- if it isn't ready, none behind
+        it are either. Never discards a sample; unready entries stay queued."""
+        while self._transfer_timing_pending:
+            n, start, end = self._transfer_timing_pending[0]
+            if not end.query():
+                break
+            self._transfer_timing_pending.popleft()
+            self.real_transfer_ms_sum += start.elapsed_time(end)
+            self.real_transfer_expert_count += n
 
     def _copy_into(self, keys: list[Key], free: list[int]) -> None:
         for (layer, gid), slot in zip(keys, free):
@@ -610,8 +640,25 @@ class ExpertCacheOffloader(BaseOffloader):
             "prefill": None,
             "decode": None,
         }
-        self._pending_timing: dict[str, tuple] = {}
+        # Per-layer FIFO of not-yet-resolved compute-timing samples. A deque
+        # (not a single slot) so a sample that isn't ready yet is retried next
+        # time, never silently discarded -- CUDA events recorded on the same
+        # stream complete in program order, so checking only the oldest
+        # pending entry per layer is sufficient and correct.
+        self._pending_timing: dict[str, deque[tuple]] = {}
         self._prev_prefetch_event: "torch.cuda.Event | None" = None
+
+        # Timing-accuracy diagnostics (2026-07-24): how many compute-timing
+        # samples actually fed the EMA (`_timing_resolved_count`), and how
+        # often the old single-slot discard-on-overwrite design would have
+        # silently thrown one away rather than retrying it
+        # (`_timing_would_have_discarded_count`) -- see `_consume_timing` and
+        # its write site in `iter_expert_waves`.
+        self._timing_resolved_count: dict[str, int] = {"prefill": 0, "decode": 0}
+        self._timing_would_have_discarded_count: dict[str, int] = {
+            "prefill": 0,
+            "decode": 0,
+        }
 
         self._resident_bytes = 0
         self.hot_hits = 0
@@ -915,20 +962,23 @@ class ExpertCacheOffloader(BaseOffloader):
         return int(slack_ms / self._t_per_expert_ms)
 
     def _consume_timing(self, layer: str) -> None:
-        pending = self._pending_timing.pop(layer, None)
-        if pending is None:
+        pending = self._pending_timing.get(layer)
+        if not pending:
             return
-        bucket, num_tokens, start, end = pending
-        if not end.query():
-            return  # not finished; skip this sample rather than sync-stall
-        elapsed = start.elapsed_time(end)
-        per_tok = elapsed / max(1, num_tokens)
-        prev = self._layer_time_ema[bucket]
-        self._layer_time_ema[bucket] = (
-            per_tok
-            if prev is None
-            else (1 - self._EMA_ALPHA) * prev + self._EMA_ALPHA * per_tok
-        )
+        while pending:
+            bucket, num_tokens, start, end = pending[0]
+            if not end.query():
+                break  # not ready yet; leave it queued, retry next time
+            pending.popleft()
+            elapsed = start.elapsed_time(end)
+            per_tok = elapsed / max(1, num_tokens)
+            prev = self._layer_time_ema[bucket]
+            self._layer_time_ema[bucket] = (
+                per_tok
+                if prev is None
+                else (1 - self._EMA_ALPHA) * prev + self._EMA_ALPHA * per_tok
+            )
+            self._timing_resolved_count[bucket] += 1
 
     def iter_expert_waves(
         self,
@@ -947,6 +997,8 @@ class ExpertCacheOffloader(BaseOffloader):
             torch.cuda.current_stream().wait_event(self._prev_prefetch_event)
             self._prev_prefetch_event = None
         self._consume_timing(layer)
+        if cuda:
+            cache.drain_transfer_timing()
 
         cur_idx = self._layer_index[layer]
         bucket = self._batch_bucket(topk_ids)
@@ -999,7 +1051,13 @@ class ExpertCacheOffloader(BaseOffloader):
 
         if end_ev is not None:
             end_ev.record()
-            self._pending_timing[layer] = (bucket, num_tokens, start_ev, end_ev)
+            pending = self._pending_timing.setdefault(layer, deque())
+            if pending:
+                # Under the old single-slot design (a plain dict entry
+                # overwritten each call) this in-flight sample would have
+                # been silently discarded rather than retried next time.
+                self._timing_would_have_discarded_count[bucket] += 1
+            pending.append((bucket, num_tokens, start_ev, end_ev))
 
         self._issue_prefetch(bucket, num_tokens, len(misses), predicted)
         cache.unpin_step()
@@ -1080,6 +1138,38 @@ class ExpertCacheOffloader(BaseOffloader):
             ),
         }
 
+    def _timing_diagnostics(self, bucket: str) -> dict[str, float]:
+        """Accuracy diagnostics for the compute-time input to
+        `_transfer_budget`: how many samples resolved and fed the EMA, how
+        often the OLD single-slot design would have silently discarded an
+        in-flight sample instead of retrying it (see `_consume_timing` and
+        its write site), and the EMA's current value."""
+        resolved = self._timing_resolved_count[bucket]
+        would_discard = self._timing_would_have_discarded_count[bucket]
+        return {
+            "resolved": resolved,
+            "would_have_discarded": would_discard,
+            "would_have_discarded_rate": (
+                would_discard / resolved if resolved else 0.0
+            ),
+            "current_ema_ms_per_token": self._layer_time_ema[bucket] or 0.0,
+        }
+
+    def _transfer_calibration_stats(self) -> dict[str, float]:
+        """Accuracy diagnostics for the transfer-time input to
+        `_transfer_budget`: the once-at-startup PCIe calibration vs the live,
+        continuously-measured real transfer time for actual loads issued
+        during serving."""
+        cache = self._cache
+        real_count = cache.real_transfer_expert_count if cache else 0
+        return {
+            "startup_ms_per_expert": self._t_per_expert_ms,
+            "real_avg_ms_per_expert": (
+                cache.real_transfer_ms_sum / real_count if cache and real_count else 0.0
+            ),
+            "real_sample_experts": real_count,
+        }
+
     def get_stats(self) -> dict:
         return {
             "hot_hits": self.hot_hits,
@@ -1095,11 +1185,14 @@ class ExpertCacheOffloader(BaseOffloader):
             "prefill": {
                 **self._bucket_metrics("prefill"),
                 **self._budget_diagnostics("prefill"),
+                **self._timing_diagnostics("prefill"),
             },
             "decode": {
                 **self._bucket_metrics("decode"),
                 **self._budget_diagnostics("decode"),
+                **self._timing_diagnostics("decode"),
             },
+            "transfer_calibration": self._transfer_calibration_stats(),
         }
 
     def _maybe_log_stats(self, cur_idx: int) -> None:
@@ -1132,6 +1225,19 @@ class ExpertCacheOffloader(BaseOffloader):
             self._pass_count,
             dbg["budget_zero"], dbg["queue_exhausted"], dbg["budget_limited"],
             dbg["avg_budget"],
+        )
+        td = self._timing_diagnostics("decode")
+        xfer = self._transfer_calibration_stats()
+        logger.info(
+            "[ExpertCacheOffloader] timing accuracy (pass=%d) decode: "
+            "resolved=%d would_have_discarded=%d (rate=%.3f) "
+            "ema_ms_per_tok=%.4f | transfer: startup_ms_per_expert=%.4f "
+            "real_avg_ms_per_expert=%.4f (n=%d)",
+            self._pass_count,
+            td["resolved"], td["would_have_discarded"],
+            td["would_have_discarded_rate"], td["current_ema_ms_per_token"],
+            xfer["startup_ms_per_expert"], xfer["real_avg_ms_per_expert"],
+            xfer["real_sample_experts"],
         )
 
     def _log_final_stats(self) -> None:

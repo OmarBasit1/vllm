@@ -14,6 +14,8 @@ Two tiers:
   exactly, for both waves=1 and waves=2.
 """
 
+from collections import deque
+
 import numpy as np
 import pytest
 import torch
@@ -549,6 +551,92 @@ def test_transfer_budget_zero_when_misses_exceed_compute_window():
     off._layer_time_ema["prefill"] = 0.5  # 100*0.5=50ms window
     assert off._transfer_budget("prefill", num_tokens=100, num_misses=200) == 0  # miss>window
     assert off._transfer_budget("prefill", num_tokens=100, num_misses=0) > 0
+
+
+# ---------------------------------------------------------------------------
+# Tier A: compute-timing accuracy diagnostics (never-discard redesign)
+# ---------------------------------------------------------------------------
+
+
+class _FakeEvent:
+    """Deterministic stand-in for a CUDA event -- avoids racing real GPU
+    timing to exercise the not-ready-yet / now-ready code paths."""
+
+    def __init__(self, ready: bool, elapsed: float = 1.0):
+        self.ready = ready
+        self._elapsed = elapsed
+
+    def query(self) -> bool:
+        return self.ready
+
+    def elapsed_time(self, _other) -> float:
+        return self._elapsed
+
+
+def test_consume_timing_retries_unready_sample_instead_of_discarding():
+    """The redesigned `_pending_timing` must retry a not-yet-resolved sample
+    on the next call rather than silently dropping it -- the bug the old
+    single-slot (plain dict, overwritten each call) design had."""
+    off, _, _ = _wire()
+    start, end = _FakeEvent(ready=False), _FakeEvent(ready=False)
+    off._pending_timing["layer.0"] = deque([("decode", 4, start, end)])
+
+    off._consume_timing("layer.0")
+    assert off._timing_resolved_count["decode"] == 0
+    assert len(off._pending_timing["layer.0"]) == 1  # retried, not discarded
+    assert off._layer_time_ema["decode"] is None
+
+    end.ready = True  # the "GPU work" has now completed
+    off._consume_timing("layer.0")
+    assert off._timing_resolved_count["decode"] == 1
+    assert len(off._pending_timing["layer.0"]) == 0
+    assert off._layer_time_ema["decode"] == pytest.approx(1.0 / 4)
+
+
+@requires_cuda
+def test_pending_timing_write_site_detects_would_have_discarded():
+    """If a prior compute-timing sample for a layer is still unresolved when
+    a new one is about to be recorded, the OLD single-slot design would have
+    silently overwritten (discarded) it. Verify the new design instead
+    retries the old sample AND counts the near-miss."""
+    off, cache, mods = _wire(E=8, pool_experts=8, waves=1)
+    stuck_start, stuck_end = _FakeEvent(ready=False), _FakeEvent(ready=False)
+    off._pending_timing["layer.0"] = deque([("decode", 1, stuck_start, stuck_end)])
+
+    list(off.iter_expert_waves(mods[0], torch.tensor([[0, 1]], device=DEVICE)))
+
+    pending = off._pending_timing["layer.0"]
+    assert any(entry[3] is stuck_end for entry in pending)  # not discarded
+    assert off._timing_would_have_discarded_count["decode"] == 1
+
+
+@requires_cuda
+def test_drain_transfer_timing_accumulates_real_load_time():
+    """A real `load()` call's returned event, once resolved, must feed
+    `real_transfer_ms_sum`/`real_transfer_expert_count` -- the live
+    counterpart to the once-at-startup PCIe calibration."""
+    off, cache, mods = _wire(E=8, pool_experts=8, waves=1)
+    assert cache.real_transfer_expert_count == 0
+    ev = cache.load([("layer.0", 3), ("layer.0", 4)], horizon=set())
+    assert ev is not None
+    torch.cuda.synchronize()  # let the real H2D copy actually complete
+    cache.drain_transfer_timing()
+    assert cache.real_transfer_expert_count == 2
+    assert cache.real_transfer_ms_sum >= 0.0
+
+
+def test_timing_diagnostics_exposed_in_get_stats():
+    off, _, _ = _wire()
+    off._pending_timing["layer.0"] = deque(
+        [("decode", 2, _FakeEvent(ready=True, elapsed=2.0), _FakeEvent(ready=True))]
+    )
+    off._consume_timing("layer.0")
+    stats = off.get_stats()
+    assert stats["decode"]["resolved"] == 1
+    assert stats["decode"]["would_have_discarded"] == 0
+    assert stats["decode"]["current_ema_ms_per_token"] == pytest.approx(1.0)
+    assert "transfer_calibration" in stats
+    assert stats["transfer_calibration"]["real_sample_experts"] == 0
 
 
 def test_horizon_keys_only_upcoming_layers():
