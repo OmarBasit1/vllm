@@ -572,7 +572,7 @@ class ExpertCacheOffloader(BaseOffloader):
 
     _BUDGET_TOLERANCE = 0.15
     _EMA_ALPHA = 0.3
-    _BUDGET_SAFETY = 0.8
+    _BUDGET_SAFETY = 0.9
 
     def __init__(
         self,
@@ -633,6 +633,21 @@ class ExpertCacheOffloader(BaseOffloader):
         }
         self._pass_count = 0
         self._STATS_LOG_INTERVAL = 50
+
+        # Prefetch-budget diagnostics: WHY did prefetch_loaded end up where it
+        # did this step? Disambiguates "the predictor/queue ran out of
+        # not-already-resident candidates" (queue_exhausted -- more transfer
+        # budget would NOT have helped) from "the transfer-budget ceiling was
+        # hit while candidates remained" (budget_limited -- more budget WOULD
+        # have let more prefetch through). budget_zero is the separate case of
+        # _transfer_budget computing no slack at all (no candidates even
+        # considered). budget_sum/budget_count let get_stats() report the
+        # mean computed budget (in experts) when it was positive.
+        self.prefetch_budget_zero: dict[str, int] = {"prefill": 0, "decode": 0}
+        self.prefetch_queue_exhausted: dict[str, int] = {"prefill": 0, "decode": 0}
+        self.prefetch_budget_limited: dict[str, int] = {"prefill": 0, "decode": 0}
+        self.prefetch_budget_sum: dict[str, int] = {"prefill": 0, "decode": 0}
+        self.prefetch_budget_count: dict[str, int] = {"prefill": 0, "decode": 0}
 
     # -- module discovery (mirrors the prefetch/uva backends) --------------
     def wrap_modules(
@@ -1000,7 +1015,10 @@ class ExpertCacheOffloader(BaseOffloader):
         assert self._cache is not None
         budget = self._transfer_budget(bucket, num_tokens, num_misses)
         if budget <= 0 or self.prefetch_horizon == 0:
+            self.prefetch_budget_zero[bucket] += 1
             return
+        self.prefetch_budget_sum[bucket] += budget
+        self.prefetch_budget_count[bucket] += 1
         # `predicted` is the single per-step predictor query (priority order,
         # upcoming layers only -- current/past layers are stale by construction
         # and never enqueued; cyclic near the end of a pass, see
@@ -1013,6 +1031,13 @@ class ExpertCacheOffloader(BaseOffloader):
             if self._cache.is_resident(*key):  # promote-on-hit / already there
                 continue
             batch.append(key)
+        # Disambiguate WHY the loop stopped: candidates ran out first (more
+        # transfer budget would not have helped this step) vs the budget
+        # ceiling was hit while candidates remained (more budget WOULD help).
+        if queue:
+            self.prefetch_budget_limited[bucket] += 1
+        else:
+            self.prefetch_queue_exhausted[bucket] += 1
         if not batch:
             return
         ev = self._cache.load(batch, horizon)
@@ -1034,6 +1059,27 @@ class ExpertCacheOffloader(BaseOffloader):
             "prefetch_ratio": s["prefetch_loaded"] / fetches if fetches else 0.0,
         }
 
+    def _budget_diagnostics(self, bucket: str) -> dict[str, float]:
+        """Why prefetch stayed low this run: `budget_zero` (no slack was ever
+        computed -- more transfer budget headroom wouldn't exist to use),
+        `queue_exhausted` (candidates ran out before the budget did -- more
+        budget would NOT help), `budget_limited` (the budget ceiling was hit
+        while candidates remained -- more budget WOULD help), and the mean
+        computed `budget` (in experts) across the calls where it was positive.
+        """
+        zero = self.prefetch_budget_zero[bucket]
+        exhausted = self.prefetch_queue_exhausted[bucket]
+        limited = self.prefetch_budget_limited[bucket]
+        count = self.prefetch_budget_count[bucket]
+        return {
+            "budget_zero": zero,
+            "queue_exhausted": exhausted,
+            "budget_limited": limited,
+            "avg_budget": (
+                self.prefetch_budget_sum[bucket] / count if count else 0.0
+            ),
+        }
+
     def get_stats(self) -> dict:
         return {
             "hot_hits": self.hot_hits,
@@ -1046,8 +1092,14 @@ class ExpertCacheOffloader(BaseOffloader):
                 if (self.hot_hits + self.cold_streamed)
                 else 0.0
             ),
-            "prefill": self._bucket_metrics("prefill"),
-            "decode": self._bucket_metrics("decode"),
+            "prefill": {
+                **self._bucket_metrics("prefill"),
+                **self._budget_diagnostics("prefill"),
+            },
+            "decode": {
+                **self._bucket_metrics("decode"),
+                **self._budget_diagnostics("decode"),
+            },
         }
 
     def _maybe_log_stats(self, cur_idx: int) -> None:
@@ -1072,6 +1124,14 @@ class ExpertCacheOffloader(BaseOffloader):
             pf["hit_rate"], pf["prefetch_ratio"],
             dc["hits"], dc["misses"], dc["prefetch_loaded"],
             dc["hit_rate"], dc["prefetch_ratio"],
+        )
+        dbg = self._budget_diagnostics("decode")
+        logger.info(
+            "[ExpertCacheOffloader] prefetch budget (pass=%d) decode: "
+            "budget_zero=%d queue_exhausted=%d budget_limited=%d avg_budget=%.2f",
+            self._pass_count,
+            dbg["budget_zero"], dbg["queue_exhausted"], dbg["budget_limited"],
+            dbg["avg_budget"],
         )
 
     def _log_final_stats(self) -> None:

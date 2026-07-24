@@ -600,6 +600,55 @@ def test_prefetch_skips_already_resident_and_loads_predicted():
     assert off.prefetch_loaded == 2  # expert 0 was already resident, not re-loaded
 
 
+def test_prefetch_budget_zero_counted(monkeypatch):
+    """`_transfer_budget` returning 0 (no slack) is a distinct diagnostic
+    bucket from either candidates-ran-out or budget-hit-the-ceiling -- no
+    candidates were even considered."""
+    off, cache, mods = _wire(
+        num_layers=2, E=8, pool_experts=8, predict_k=3, prefetch_horizon=1
+    )
+    monkeypatch.setattr(off, "_transfer_budget", lambda *a, **k: 0)
+    off._issue_prefetch(
+        "decode", num_tokens=1, num_misses=0, predicted=[("layer.1", 0)]
+    )
+    assert off.prefetch_budget_zero["decode"] == 1
+    assert off.prefetch_queue_exhausted["decode"] == 0
+    assert off.prefetch_budget_limited["decode"] == 0
+    assert off.get_stats()["decode"]["budget_zero"] == 1
+
+
+def test_prefetch_queue_exhausted_when_candidates_run_out_first(monkeypatch):
+    """Budget far exceeds the candidate count -> the queue empties before the
+    budget ceiling is ever hit. More budget would NOT have changed the
+    outcome this step."""
+    off, cache, mods = _wire(
+        num_layers=2, E=8, pool_experts=8, predict_k=3, prefetch_horizon=1
+    )
+    monkeypatch.setattr(off, "_transfer_budget", lambda *a, **k: 100)
+    predicted = [("layer.1", 0), ("layer.1", 1)]
+    off._issue_prefetch("decode", num_tokens=1, num_misses=0, predicted=predicted)
+    assert off.prefetch_queue_exhausted["decode"] == 1
+    assert off.prefetch_budget_limited["decode"] == 0
+    assert off.prefetch_loaded == 2
+    stats = off.get_stats()["decode"]
+    assert stats["queue_exhausted"] == 1
+    assert stats["avg_budget"] == 100.0
+
+
+def test_prefetch_budget_limited_when_ceiling_hit_first(monkeypatch):
+    """Budget is smaller than the candidate count -> the ceiling is hit while
+    candidates remain. This is the "more budget would help" signal."""
+    off, cache, mods = _wire(
+        num_layers=2, E=8, pool_experts=8, predict_k=3, prefetch_horizon=1
+    )
+    monkeypatch.setattr(off, "_transfer_budget", lambda *a, **k: 1)
+    predicted = [("layer.1", 0), ("layer.1", 1), ("layer.1", 2)]
+    off._issue_prefetch("decode", num_tokens=1, num_misses=0, predicted=predicted)
+    assert off.prefetch_budget_limited["decode"] == 1
+    assert off.prefetch_queue_exhausted["decode"] == 0
+    assert off.prefetch_loaded == 1  # only 1 of 3 candidates got through
+
+
 # ---------------------------------------------------------------------------
 # Tier A: bucketed hit-rate / prefetch-ratio instrumentation
 # ---------------------------------------------------------------------------
