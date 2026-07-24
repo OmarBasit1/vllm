@@ -318,6 +318,64 @@ def test_hybrid_predictor_only_caches_latest_layer_observation(tmp_path):
     assert set(predictor._hidden.keys()) == {5}
 
 
+@requires_cuda
+def test_hybrid_predictor_cuda_graph_matches_eager(tmp_path):
+    """The CUDA-graph fast path must be numerically identical to the eager
+    forward -- graph replay recomputes the same MLP+topk, so the predicted
+    expert set must match exactly."""
+    artifacts_dir = _write_hybrid_artifacts(tmp_path, num_experts=8, hidden_dim=4)
+    predictor = create_predictor("hybrid", artifacts_dir=artifacts_dir)
+    hidden = torch.randn(5, 4, device=DEVICE)
+    predictor.observe(
+        0, torch.zeros(5, 1, dtype=torch.long, device=DEVICE), hidden
+    )
+
+    predictor._cuda_graphs_ok = False  # force eager
+    eager = predictor.predict(1, k=4)
+    predictor._cuda_graphs_ok = True  # re-enable -> captures + replays a graph
+    graphed = predictor.predict(1, k=4)
+
+    assert predictor._graphs, "graph was not captured on the CUDA path"
+    assert graphed == eager
+
+
+@requires_cuda
+def test_hybrid_predictor_graph_reused_and_tracks_new_input(tmp_path):
+    """A second call at the same shape replays the cached graph (no new
+    capture), and still reflects a *new* observed hidden -- i.e. the graph
+    reads the refreshed static input, not a stale capture-time snapshot."""
+    artifacts_dir = _write_hybrid_artifacts(tmp_path, num_experts=8, hidden_dim=4)
+    predictor = create_predictor("hybrid", artifacts_dir=artifacts_dir)
+
+    predictor.observe(0, torch.zeros(3, 1, dtype=torch.long, device=DEVICE),
+                      torch.randn(3, 4, device=DEVICE))
+    first = predictor.predict(1, k=4)
+    assert len(predictor._graphs) == 1
+
+    predictor.observe(0, torch.zeros(3, 1, dtype=torch.long, device=DEVICE),
+                      torch.randn(3, 4, device=DEVICE))
+    second = predictor.predict(1, k=4)
+    assert len(predictor._graphs) == 1  # reused, not re-captured
+    # Cross-check the replay tracked the new input by comparing to eager.
+    predictor._cuda_graphs_ok = False
+    assert predictor.predict(1, k=4) == second
+    assert isinstance(first, list) and isinstance(second, list)
+
+
+@requires_cuda
+def test_hybrid_predictor_large_batch_skips_graph(tmp_path):
+    """Token counts above `_MAX_GRAPH_BATCH` (large prefill chunks) take the
+    eager path and never capture a graph, bounding graph memory."""
+    artifacts_dir = _write_hybrid_artifacts(tmp_path, num_experts=8, hidden_dim=4)
+    predictor = create_predictor("hybrid", artifacts_dir=artifacts_dir)
+    big = predictor._MAX_GRAPH_BATCH + 1
+    predictor.observe(0, torch.zeros(big, 1, dtype=torch.long, device=DEVICE),
+                      torch.randn(big, 4, device=DEVICE))
+    out = predictor.predict(1, k=4)
+    assert predictor._graphs == {}  # no graph for an oversized batch
+    assert len(out) == 4
+
+
 def test_hybrid_predictor_mlp_not_among_routed_experts(tmp_path):
     """Structural guard for "keep the predictor MLP resident, never
     offloaded": the MLP module must never be one of the modules the cache

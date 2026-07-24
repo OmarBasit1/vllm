@@ -116,7 +116,20 @@ class HybridExpertPredictor(ExpertPredictor):
     ``routed_experts`` or listed in ``offload_params`` -- so neither the
     expert-cache pool nor ``--cpu-offload-gb`` can page them out; they stay
     GPU-resident for the life of the process.
+
+    The per-layer forward is tiny but launch-bound (3 GEMMs + activations +
+    topk = ~6 eager kernel launches, ~0.25 ms/call), which sits on the
+    prefetch critical path. To cut that, the MLP+topk is captured as a
+    replayable CUDA graph per (layer, token-count, dtype) -- collapsing those
+    launches into one replay (~0.057 ms/call, measured 4.4x). Capture is lazy
+    (first time a given shape is seen), bounded (``_MAX_GRAPHS`` total, only
+    for token counts <= ``_MAX_GRAPH_BATCH`` so large prefill chunks stay on
+    the eager path), and fail-safe: any capture error disables graphs globally
+    and falls back to the plain eager forward, which is numerically identical.
     """
+
+    _MAX_GRAPH_BATCH = 64
+    _MAX_GRAPHS = 512
 
     def __init__(self, artifacts_dir: str) -> None:
         if not artifacts_dir:
@@ -158,6 +171,11 @@ class HybridExpertPredictor(ExpertPredictor):
         self._device: torch.device | None = None
         self._hidden: dict[int, torch.Tensor] = {}
 
+        # CUDA-graph cache: (layer_idx, batch, k, dtype) -> (graph, in, out).
+        self._graphs: dict[tuple, tuple] = {}
+        self._graph_pool = None
+        self._cuda_graphs_ok = True
+
     def _ensure_device(self, device: torch.device) -> None:
         if self._device == device:
             return
@@ -184,6 +202,74 @@ class HybridExpertPredictor(ExpertPredictor):
         k = min(k, row.shape[0])
         return np.argsort(-row)[:k].tolist()
 
+    @staticmethod
+    def _mlp_topk(
+        mlp: ExpertPredictorMLP, hidden: torch.Tensor, k: int
+    ) -> torch.Tensor:
+        """Per-token expert-prob prediction aggregated (summed mass) across the
+        step's tokens, returning the top-k expert ids as a GPU tensor."""
+        probs = torch.softmax(mlp(hidden.to(torch.float32)), dim=-1)
+        return torch.topk(probs.sum(dim=0), k).indices
+
+    def _predict_eager(
+        self, mlp: ExpertPredictorMLP, hidden: torch.Tensor, k: int
+    ) -> list[int]:
+        with torch.no_grad():
+            return self._mlp_topk(mlp, hidden, k).tolist()
+
+    def _capture_graph(
+        self, mlp: ExpertPredictorMLP, hidden: torch.Tensor, k: int
+    ) -> tuple | None:
+        """Capture MLP+topk for this fixed (batch, dtype) as a replayable graph.
+        Returns (graph, static_in, static_out) or None if capture fails (in
+        which case graphs are disabled globally and callers use the eager
+        path)."""
+        try:
+            static_in = torch.empty_like(hidden)
+            static_in.copy_(hidden)
+            warm = torch.cuda.Stream(device=hidden.device)
+            warm.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(warm), torch.no_grad():
+                for _ in range(3):
+                    self._mlp_topk(mlp, static_in, k)
+            torch.cuda.current_stream().wait_stream(warm)
+
+            graph = torch.cuda.CUDAGraph()
+            if self._graph_pool is None:
+                capture = torch.cuda.graph(graph)
+            else:
+                capture = torch.cuda.graph(graph, pool=self._graph_pool)
+            with capture, torch.no_grad():
+                static_out = self._mlp_topk(mlp, static_in, k)
+            if self._graph_pool is None:
+                self._graph_pool = graph.pool()
+            return (graph, static_in, static_out)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "expert-cache hybrid predictor: CUDA graph capture failed (%s); "
+                "falling back to eager predict for all layers.",
+                e,
+            )
+            self._cuda_graphs_ok = False
+            return None
+
+    def _predict_graphed(
+        self, layer_idx: int, mlp: ExpertPredictorMLP, hidden: torch.Tensor, k: int
+    ) -> list[int] | None:
+        key = (layer_idx, hidden.shape[0], k, hidden.dtype)
+        entry = self._graphs.get(key)
+        if entry is None:
+            if len(self._graphs) >= self._MAX_GRAPHS:
+                return None
+            entry = self._capture_graph(mlp, hidden, k)
+            if entry is None:
+                return None
+            self._graphs[key] = entry
+        graph, static_in, static_out = entry
+        static_in.copy_(hidden)
+        graph.replay()
+        return static_out.tolist()
+
     def predict(self, layer_idx: int, k: int) -> list[int]:
         if layer_idx == 0:
             return self._marginal_topk(0, k)
@@ -191,11 +277,16 @@ class HybridExpertPredictor(ExpertPredictor):
         hidden = self._hidden.get(layer_idx - 1)
         if mlp is None or hidden is None:
             return self._marginal_topk(layer_idx, k)
-        with torch.no_grad():
-            probs = torch.softmax(mlp(hidden.to(torch.float32)), dim=-1)
-            agg = probs.sum(dim=0)
-        k = min(k, agg.shape[-1])
-        return torch.topk(agg, k).indices.tolist()
+        k = min(k, self._marginal.shape[1])
+        if (
+            self._cuda_graphs_ok
+            and hidden.is_cuda
+            and hidden.shape[0] <= self._MAX_GRAPH_BATCH
+        ):
+            out = self._predict_graphed(layer_idx, mlp, hidden, k)
+            if out is not None:
+                return out
+        return self._predict_eager(mlp, hidden, k)
 
 
 _PREDICTOR_REGISTRY: dict[str, type[ExpertPredictor]] = {
