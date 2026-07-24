@@ -553,6 +553,47 @@ def test_transfer_budget_zero_when_misses_exceed_compute_window():
     assert off._transfer_budget("prefill", num_tokens=100, num_misses=0) > 0
 
 
+def test_effective_transfer_rate_falls_back_to_startup_calibration():
+    """Before any real transfer has been measured (`real_ms_per_expert_ema`
+    is None), `_transfer_budget` must use the once-at-startup calibration."""
+    off, cache, _ = _wire()
+    off._t_per_expert_ms = 2.0
+    assert cache.real_ms_per_expert_ema is None
+    assert off._effective_t_per_expert_ms() == 2.0
+
+
+def test_effective_transfer_rate_prefers_live_ema_once_measured():
+    """Once real transfers have been measured, the live EMA -- not the
+    once-at-startup snapshot -- must drive the budget calculation (fixes the
+    measured ~16% overestimate from the once-at-startup calibration, exp12)."""
+    off, cache, _ = _wire()
+    off._t_per_expert_ms = 2.0  # stale/inaccurate startup calibration
+    cache.real_ms_per_expert_ema = 0.5  # live-measured, much faster
+    assert off._effective_t_per_expert_ms() == 0.5
+
+    off._layer_time_ema["prefill"] = 1.0
+    # 100 tokens * 1.0ms = 100ms compute; 10 misses * 0.5ms = 5ms transfer.
+    # Using the stale 2.0ms/expert instead would compute t_miss=20ms and a
+    # smaller budget -- confirm the live rate, not the stale one, is used.
+    budget_live = off._transfer_budget("prefill", num_tokens=100, num_misses=10)
+    cache.real_ms_per_expert_ema = None  # revert to the stale calibration
+    budget_stale = off._transfer_budget("prefill", num_tokens=100, num_misses=10)
+    assert budget_live > budget_stale
+
+
+@requires_cuda
+def test_drain_transfer_timing_updates_live_ema():
+    """`drain_transfer_timing` must update `real_ms_per_expert_ema` (not just
+    the lifetime sum/count) from a real, resolved `load()`."""
+    off, cache, mods = _wire(E=8, pool_experts=8, waves=1)
+    assert cache.real_ms_per_expert_ema is None
+    cache.load([("layer.0", 3), ("layer.0", 4)], horizon=set())
+    torch.cuda.synchronize()
+    cache.drain_transfer_timing()
+    assert cache.real_ms_per_expert_ema is not None
+    assert cache.real_ms_per_expert_ema >= 0.0
+
+
 # ---------------------------------------------------------------------------
 # Tier A: compute-timing accuracy diagnostics (never-discard redesign)
 # ---------------------------------------------------------------------------

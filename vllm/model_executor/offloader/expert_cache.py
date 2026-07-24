@@ -365,6 +365,8 @@ class _GlobalExpertCache:
     per-wave ``_expert_map`` changes.
     """
 
+    _EMA_ALPHA = 0.3  # matches ExpertCacheOffloader._EMA_ALPHA (compute-time side)
+
     def __init__(
         self,
         param_names: list[str],
@@ -399,17 +401,23 @@ class _GlobalExpertCache:
 
         self._copy_stream: torch.cuda.Stream | None = None
 
-        # Real (live-measured) transfer-time accumulation, for comparing
-        # against the once-at-startup PCIe calibration (`_t_per_expert_ms`) --
-        # see `ExpertCacheOffloader._calibrate_pcie`. A FIFO, drained
-        # opportunistically (never discarded -- CUDA events on the same
-        # stream complete in program order, so checking only the oldest
-        # entry is sufficient and correct).
+        # Real (live-measured) transfer-time tracking, replacing reliance on
+        # the once-at-startup PCIe calibration (`_t_per_expert_ms`) -- see
+        # `ExpertCacheOffloader._calibrate_pcie` and `_effective_t_per_expert_ms`.
+        # A FIFO, drained opportunistically (never discarded -- CUDA events on
+        # the same stream complete in program order, so checking only the
+        # oldest entry is sufficient and correct).
         self._transfer_timing_pending: deque[
             tuple[int, torch.cuda.Event, torch.cuda.Event]
         ] = deque()
+        # Lifetime sum/count (diagnostic only: an all-time average for
+        # get_stats()/logging). `real_ms_per_expert_ema` is the value actually
+        # fed back into `_transfer_budget` -- an EMA (not a lifetime average)
+        # so it can track drift over a long-running server, matching the
+        # design already used for the compute-time estimate.
         self.real_transfer_ms_sum = 0.0
         self.real_transfer_expert_count = 0
+        self.real_ms_per_expert_ema: float | None = None
 
     # -- setup -------------------------------------------------------------
     def register_layer(
@@ -533,18 +541,29 @@ class _GlobalExpertCache:
 
     def drain_transfer_timing(self) -> None:
         """Accumulate real (live-measured) H2D transfer time for completed
-        loads into `real_transfer_ms_sum`/`real_transfer_expert_count`, for
-        comparison against the once-at-startup PCIe calibration. Events on
-        the copy stream complete in program order, so checking only the
-        oldest pending entry is sufficient -- if it isn't ready, none behind
-        it are either. Never discards a sample; unready entries stay queued."""
+        loads. Updates both the lifetime `real_transfer_ms_sum`/
+        `real_transfer_expert_count` (diagnostic-only, an all-time average)
+        and `real_ms_per_expert_ema` (an EMA, like the compute-time estimate,
+        so it tracks drift over a long-running server -- this is the value
+        `_transfer_budget` actually uses). Events on the copy stream complete
+        in program order, so checking only the oldest pending entry is
+        sufficient -- if it isn't ready, none behind it are either. Never
+        discards a sample; unready entries stay queued."""
         while self._transfer_timing_pending:
             n, start, end = self._transfer_timing_pending[0]
             if not end.query():
                 break
             self._transfer_timing_pending.popleft()
-            self.real_transfer_ms_sum += start.elapsed_time(end)
+            elapsed = start.elapsed_time(end)
+            self.real_transfer_ms_sum += elapsed
             self.real_transfer_expert_count += n
+            ms_per_expert = elapsed / max(1, n)
+            prev = self.real_ms_per_expert_ema
+            self.real_ms_per_expert_ema = (
+                ms_per_expert
+                if prev is None
+                else (1 - self._EMA_ALPHA) * prev + self._EMA_ALPHA * ms_per_expert
+            )
 
     def _copy_into(self, keys: list[Key], free: list[int]) -> None:
         for (layer, gid), slot in zip(keys, free):
@@ -948,18 +967,36 @@ class ExpertCacheOffloader(BaseOffloader):
     def _horizon_keys(self, cur_idx: int) -> set[Key]:
         return set(self._predict_upcoming(cur_idx))
 
+    def _effective_t_per_expert_ms(self) -> float:
+        """The transfer-cost estimate `_transfer_budget` actually uses.
+
+        Prefers the live, continuously-updated EMA of real H2D transfer time
+        (`_GlobalExpertCache.real_ms_per_expert_ema`, fed by real loads issued
+        during serving) over the once-at-startup `_calibrate_pcie` snapshot.
+        Measured (2026-07-24, exp12): the startup calibration was ~16% slower
+        than reality (0.446 vs 0.373 ms/expert measured live), so this
+        removes a systematic source of overly conservative budgeting. Falls
+        back to the static calibration until the live EMA has a first sample
+        (there is always at least the startup value once `_calibrate_pcie`
+        has run, so this is only `<= 0` before that)."""
+        cache = self._cache
+        if cache is not None and cache.real_ms_per_expert_ema is not None:
+            return cache.real_ms_per_expert_ema
+        return self._t_per_expert_ms
+
     def _transfer_budget(self, bucket: str, num_tokens: int, num_misses: int) -> int:
-        if self._t_per_expert_ms <= 0:
+        t_per_expert_ms = self._effective_t_per_expert_ms()
+        if t_per_expert_ms <= 0:
             return 0
         per_tok = self._layer_time_ema[bucket]
         if per_tok is None:
             return 0  # not warmed yet: no speculation until we can size it
         t_compute = per_tok * num_tokens
-        t_miss = num_misses * self._t_per_expert_ms
+        t_miss = num_misses * t_per_expert_ms
         slack_ms = (t_compute - t_miss) * self._BUDGET_SAFETY
         if slack_ms <= 0:
             return 0
-        return int(slack_ms / self._t_per_expert_ms)
+        return int(slack_ms / t_per_expert_ms)
 
     def _consume_timing(self, layer: str) -> None:
         pending = self._pending_timing.get(layer)
@@ -1157,9 +1194,10 @@ class ExpertCacheOffloader(BaseOffloader):
 
     def _transfer_calibration_stats(self) -> dict[str, float]:
         """Accuracy diagnostics for the transfer-time input to
-        `_transfer_budget`: the once-at-startup PCIe calibration vs the live,
-        continuously-measured real transfer time for actual loads issued
-        during serving."""
+        `_transfer_budget`: the once-at-startup PCIe calibration, the live
+        lifetime average, and the EMA `_transfer_budget` actually uses (see
+        `_effective_t_per_expert_ms`) -- these can differ since the EMA
+        weights recent samples more than the lifetime average does."""
         cache = self._cache
         real_count = cache.real_transfer_expert_count if cache else 0
         return {
@@ -1167,6 +1205,7 @@ class ExpertCacheOffloader(BaseOffloader):
             "real_avg_ms_per_expert": (
                 cache.real_transfer_ms_sum / real_count if cache and real_count else 0.0
             ),
+            "effective_ms_per_expert": self._effective_t_per_expert_ms(),
             "real_sample_experts": real_count,
         }
 
@@ -1232,12 +1271,12 @@ class ExpertCacheOffloader(BaseOffloader):
             "[ExpertCacheOffloader] timing accuracy (pass=%d) decode: "
             "resolved=%d would_have_discarded=%d (rate=%.3f) "
             "ema_ms_per_tok=%.4f | transfer: startup_ms_per_expert=%.4f "
-            "real_avg_ms_per_expert=%.4f (n=%d)",
+            "real_avg_ms_per_expert=%.4f effective_ms_per_expert=%.4f (n=%d)",
             self._pass_count,
             td["resolved"], td["would_have_discarded"],
             td["would_have_discarded_rate"], td["current_ema_ms_per_token"],
             xfer["startup_ms_per_expert"], xfer["real_avg_ms_per_expert"],
-            xfer["real_sample_experts"],
+            xfer["effective_ms_per_expert"], xfer["real_sample_experts"],
         )
 
     def _log_final_stats(self) -> None:
