@@ -587,6 +587,33 @@ def test_prefetch_loaded_bucketed_by_triggering_step():
     assert off.bucket_stats["decode"]["prefetch_loaded"] == 0
 
 
+def test_predict_called_once_per_step_even_when_prefetch_fires():
+    """The predictor is queried exactly once per (layer, step): the
+    eviction-protection horizon and the prefetch queue share that one call,
+    not one each. Matters for a costly predictor (e.g. the hybrid MLP whose
+    predict() forces a GPU sync) -- a second call would double its overhead."""
+
+    class _CountingPredictor(ExpertPredictor):
+        def __init__(self):
+            self.calls = 0
+
+        def predict(self, layer_idx: int, k: int) -> list[int]:
+            self.calls += 1
+            return list(range(k))
+
+    off, cache, mods = _wire(
+        num_layers=2, E=8, pool_experts=8, waves=1, predict_k=3, prefetch_horizon=1
+    )
+    off.predictor = _CountingPredictor()
+    # Force a positive transfer budget so _issue_prefetch actually runs its
+    # queue-building path (the second historical predict() call site).
+    off._t_per_expert_ms = 0.001
+    off._layer_time_ema["prefill"] = 1.0
+    list(off.iter_expert_waves(mods[0], torch.zeros(32, 2, dtype=torch.long, device=DEVICE)))
+    # prefetch_horizon=1 -> exactly one upcoming layer -> exactly one predict().
+    assert off.predictor.calls == 1
+
+
 def test_periodic_stats_log_fires_only_on_layer_zero_at_interval(monkeypatch):
     off, cache, mods = _wire(num_layers=3, E=8, pool_experts=8, waves=1)
     off._STATS_LOG_INTERVAL = 2

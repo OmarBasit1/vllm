@@ -776,13 +776,24 @@ class ExpertCacheOffloader(BaseOffloader):
         horizon = min(self.prefetch_horizon, max(0, n - 1))
         return [(cur_idx + offset) % n for offset in range(1, horizon + 1)]
 
-    def _horizon_keys(self, cur_idx: int) -> set[Key]:
-        keys: set[Key] = set()
+    def _predict_upcoming(self, cur_idx: int) -> list[Key]:
+        """Query the predictor for the upcoming layers ONCE per step, returned
+        in priority order (nearest layer first, predictor order within a
+        layer) so `_issue_prefetch` can truncate to the transfer budget
+        meaningfully. Both consumers -- the eviction-protection horizon
+        (`set(...)`) and the prefetch queue (`deque(...)`) -- derive from this
+        single call, so a costly predictor (e.g. the hybrid MLP) runs at most
+        once per (layer, step) rather than once each in `_horizon_keys` and
+        `_issue_prefetch`."""
+        keys: list[Key] = []
         for tl in self._upcoming_layers(cur_idx):
             lname = self._layer_order[tl]
             for g in self.predictor.predict(tl, self.predict_k):
-                keys.add((lname, g))
+                keys.append((lname, g))
         return keys
+
+    def _horizon_keys(self, cur_idx: int) -> set[Key]:
+        return set(self._predict_upcoming(cur_idx))
 
     def _transfer_budget(self, bucket: str, num_tokens: int, num_misses: int) -> int:
         if self._t_per_expert_ms <= 0:
@@ -848,7 +859,10 @@ class ExpertCacheOffloader(BaseOffloader):
 
         # Reserve the whole current-iteration working set before any eviction.
         cache.pin_step({(layer, g) for g in needed})
-        horizon = self._horizon_keys(cur_idx)
+        # Single predictor query per step; horizon (eviction protection) and the
+        # prefetch queue both derive from it.
+        predicted = self._predict_upcoming(cur_idx)
+        horizon = set(predicted)
         miss_event = cache.load([(layer, g) for g in misses], horizon)
         self.bytes_streamed += len(misses) * cache.per_expert_bytes
 
@@ -881,31 +895,27 @@ class ExpertCacheOffloader(BaseOffloader):
             end_ev.record()
             self._pending_timing[layer] = (bucket, num_tokens, start_ev, end_ev)
 
-        self._issue_prefetch(cur_idx, bucket, num_tokens, len(misses), horizon)
+        self._issue_prefetch(bucket, num_tokens, len(misses), predicted)
         cache.unpin_step()
         self._maybe_log_stats(cur_idx)
 
     def _issue_prefetch(
         self,
-        cur_idx: int,
         bucket: str,
         num_tokens: int,
         num_misses: int,
-        horizon: set[Key],
+        predicted: list[Key],
     ) -> None:
         assert self._cache is not None
         budget = self._transfer_budget(bucket, num_tokens, num_misses)
         if budget <= 0 or self.prefetch_horizon == 0:
             return
-        # Candidate queue: predicted experts for upcoming layers only (entries for
-        # the current or past layers are stale by construction and never enqueued).
-        # Cyclic: near the end of a pass this reaches into the next pass's
-        # early layers -- see `_upcoming_layers`.
-        queue: deque[Key] = deque()
-        for tl in self._upcoming_layers(cur_idx):
-            lname = self._layer_order[tl]
-            for g in self.predictor.predict(tl, self.predict_k):
-                queue.append((lname, g))
+        # `predicted` is the single per-step predictor query (priority order,
+        # upcoming layers only -- current/past layers are stale by construction
+        # and never enqueued; cyclic near the end of a pass, see
+        # `_upcoming_layers`). Its set is the eviction-protection horizon.
+        horizon = set(predicted)
+        queue: deque[Key] = deque(predicted)
         batch: list[Key] = []
         while queue and len(batch) < budget:
             key = queue.popleft()
