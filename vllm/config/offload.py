@@ -10,7 +10,7 @@ from pydantic import Field, model_validator
 from vllm.config.utils import config
 
 OffloadBackend = Literal["auto", "uva", "prefetch", "expert_cache"]
-EvictionPolicy = Literal["lfu"]
+EvictionPolicy = Literal["lfu", "lru", "mru"]
 
 
 @config
@@ -124,8 +124,15 @@ class ExpertCacheOffloadConfig:
     by hand. Default 0 disables the check."""
 
     eviction_policy: EvictionPolicy = "lfu"
-    """Eviction policy for the shared pool. Only "lfu" is shipped (graded:
-    predicted-soon experts are evicted only as a last resort)."""
+    """Eviction policy for the shared pool. All three keep predicted-soon
+    ("horizon") experts as a last resort (evicted only if every other
+    resident expert is exhausted first) and can never evict the current
+    step's working set -- no other eviction restriction applies. "lfu"
+    (default): graded least-frequently-used, using GLOBAL (all-layer,
+    hit+miss) frequency, not a residency-scoped count. "lru": graded
+    least-recently-used (recency in layer-steps, not wall-clock). "mru":
+    most-recently-used (the mirror image of "lru"; no distance awareness,
+    see `eviction_distance_weight`)."""
 
     predictor: str = "hybrid"
     """Predictor identifier. "first_k" statically predicts global expert ids
@@ -153,6 +160,19 @@ class ExpertCacheOffloadConfig:
     entirely closed regardless of predictor; ~0.7-0.9 opens it fully, where
     "hybrid" pulls decisively ahead of "first_k" on both hit_rate and
     latency. Default 0.9 (the value used in that winning trial)."""
+
+    eviction_distance_weight: float = Field(default=0.0, ge=0, le=1)
+    """Blend weight for layer-distance awareness in "lfu"/"lru" (ignored by
+    "mru"). 0 (default) is the textbook policy. >0 additionally protects
+    experts whose layer is about to execute (small forward distance from the
+    currently-executing layer) and prioritizes evicting experts whose layer
+    just executed (maximal forward distance, i.e. one full pass away)."""
+
+    eviction_freq_decay: float = Field(default=1.0, gt=0, le=1)
+    """Geometric decay applied to all "lfu" frequency counts periodically
+    (see `_GlobalExpertCache._DECAY_INTERVAL`). 1.0 (default) disables decay,
+    reproducing the original never-decaying lifetime counts. Ignored by
+    "lru"/"mru"."""
 
     offload_params: set[str] = Field(default_factory=set)
     """The set of parameter name segments to target for expert caching.

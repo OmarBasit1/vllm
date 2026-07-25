@@ -23,11 +23,13 @@ import torch.nn as nn
 
 from vllm.model_executor.offloader.expert_cache import (
     DummyFirstKPredictor,
-    EvictionPolicy,
+    EvictionContext,
     ExpertCacheOffloader,
     ExpertPredictor,
     HybridExpertPredictor,
     LFUEviction,
+    LRUEviction,
+    MRUEviction,
     _GlobalExpertCache,
     create_eviction,
     create_predictor,
@@ -100,7 +102,9 @@ def _wire(
     for layer_idx in range(num_layers):
         name = f"layer.{layer_idx}"
         module = _FakeRoutedExperts(name, E)
-        cache.register_layer(name, module, {"w13_weight": _layer_cpu(layer_idx, E)})
+        cache.register_layer(
+            name, module, {"w13_weight": _layer_cpu(layer_idx, E)}, layer_idx
+        )
         off._layer_order.append(name)
         off._layer_index[name] = layer_idx
         off._routed_experts[name] = module
@@ -172,10 +176,19 @@ def test_predictor_registry_pluggability():
 
 def test_eviction_registry_and_rejects_unknown_policy():
     assert isinstance(create_eviction("lfu"), LFUEviction)
+    assert isinstance(create_eviction("lru"), LRUEviction)
+    assert isinstance(create_eviction("mru"), MRUEviction)
     with pytest.raises(ValueError, match="Unknown expert-cache eviction policy"):
-        create_eviction("mru")
+        create_eviction("arc")
     with pytest.raises(ValueError, match="waves must be 1 or 2"):
         ExpertCacheOffloader(pool_experts=8, waves=3)
+
+
+def test_create_eviction_rejects_out_of_range_distance_weight():
+    with pytest.raises(ValueError, match="distance_weight"):
+        create_eviction("lfu", distance_weight=1.5)
+    with pytest.raises(ValueError, match="distance_weight"):
+        create_eviction("lru", distance_weight=-0.1)
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +333,36 @@ def test_hybrid_predictor_only_caches_latest_layer_observation(tmp_path):
     assert set(predictor._hidden.keys()) == {5}
 
 
+class _FixedLogitsMLP:
+    """Deterministic stand-in for a per-layer MLP: returns pre-set logits
+    per row instead of running a real trained network, so `_mlp_topk`'s
+    batched-token aggregation can be tested in isolation from the model."""
+
+    def __init__(self, logits: torch.Tensor):
+        self._logits = logits
+
+    def __call__(self, hidden: torch.Tensor) -> torch.Tensor:
+        return self._logits
+
+
+def test_mlp_topk_merges_batch_and_ranks_overlap_first():
+    """Two tokens' predicted distributions must be SUMMED (not concatenated)
+    before top-k: an expert both tokens agree on ("overlap") ranks ahead of
+    one only a single token favors, and the result never exceeds k ids even
+    though every token votes -- so a batch of N tokens yields <=k unique
+    predicted experts, not N*k."""
+    E, k = 8, 3
+    logits = torch.zeros(2, E)
+    logits[:, 5] = 10.0  # both tokens strongly favor expert 5 (the overlap)
+    logits[0, 2] = 8.0  # token 0 alone also favors expert 2
+    logits[1, 7] = 3.0  # token 1 alone weakly favors expert 7
+    mlp = _FixedLogitsMLP(logits)
+    top = HybridExpertPredictor._mlp_topk(mlp, torch.zeros(2, 4), k)
+    ids = top.tolist()
+    assert len(ids) <= k
+    assert ids[0] == 5, "the overlapping expert must rank first"
+
+
 @requires_cuda
 def test_hybrid_predictor_cuda_graph_matches_eager(tmp_path):
     """The CUDA-graph fast path must be numerically identical to the eager
@@ -413,13 +456,69 @@ def test_iter_expert_waves_calls_observe_before_horizon(tmp_path):
 
 def test_lfu_rank_orders_nonhorizon_low_freq_first():
     policy = LFUEviction()
+    ctx = EvictionContext(cur_layer_idx=0, num_layers=4, tick=10, max_freq=9)
     # non-horizon before horizon; within a tier, lower freq first.
-    assert policy.rank(("l", 0), freq=5, in_horizon=False) < policy.rank(
-        ("l", 1), freq=1, in_horizon=True
+    assert policy.rank(("l", 0), 5, 0, False, 0, ctx) < policy.rank(
+        ("l", 1), 1, 0, True, 0, ctx
     )
-    assert policy.rank(("l", 0), freq=1, in_horizon=False) < policy.rank(
-        ("l", 1), freq=9, in_horizon=False
+    assert policy.rank(("l", 0), 1, 0, False, 0, ctx) < policy.rank(
+        ("l", 1), 9, 0, False, 0, ctx
     )
+
+
+def test_lru_rank_orders_nonhorizon_stale_first():
+    policy = LRUEviction()
+    ctx = EvictionContext(cur_layer_idx=0, num_layers=4, tick=10, max_freq=1)
+    # non-horizon before horizon; within a tier, the older (smaller last_used,
+    # i.e. staler) entry goes first.
+    assert policy.rank(("l", 0), 0, 2, False, 0, ctx) < policy.rank(
+        ("l", 1), 0, 8, False, 0, ctx
+    )
+    assert policy.rank(("l", 0), 0, 9, False, 0, ctx) < policy.rank(
+        ("l", 1), 0, 1, True, 0, ctx
+    )
+
+
+def test_mru_rank_orders_nonhorizon_fresh_first():
+    """MRU is the mirror of LRU: the MOST recently used goes first."""
+    policy = MRUEviction()
+    ctx = EvictionContext(cur_layer_idx=0, num_layers=4, tick=10, max_freq=1)
+    assert policy.rank(("l", 0), 0, 8, False, 0, ctx) < policy.rank(
+        ("l", 1), 0, 2, False, 0, ctx
+    )
+
+
+def test_lfu_distance_weight_zero_reproduces_plain_lfu():
+    """`distance_weight=0` must be a pure passthrough to plain graded-LFU --
+    a regression guard for the pre-Phase-5 behavior."""
+    plain = LFUEviction(distance_weight=0.0)
+    ctx = EvictionContext(cur_layer_idx=10, num_layers=48, tick=100, max_freq=20)
+    # layer_idx varies wildly but must have zero effect at w=0.
+    r_near = plain.rank(("l", 0), 5, 0, False, 11, ctx)
+    r_far = plain.rank(("l", 0), 5, 0, False, 9, ctx)
+    assert r_near == r_far == (False, 5 / 20)
+
+
+def test_lfu_distance_weight_prioritizes_next_layer_over_previous():
+    """At layer i, the i-1 experts (just executed, furthest from next use)
+    must be more evictable than the i+1 experts (about to run), at equal
+    frequency -- the exact intuition requested: least priority weight for
+    what was just used, most for what's coming up next."""
+    policy = LFUEviction(distance_weight=1.0)
+    n = 8
+    ctx = EvictionContext(cur_layer_idx=4, num_layers=n, tick=10, max_freq=1)
+    prev_layer_rank = policy.rank(("l", 3), 0, 0, False, 3, ctx)  # i-1
+    next_layer_rank = policy.rank(("l", 5), 0, 0, False, 5, ctx)  # i+1
+    assert prev_layer_rank < next_layer_rank
+
+
+def test_lru_distance_weight_prioritizes_next_layer_over_previous():
+    policy = LRUEviction(distance_weight=1.0)
+    n = 8
+    ctx = EvictionContext(cur_layer_idx=4, num_layers=n, tick=10, max_freq=1)
+    prev_layer_rank = policy.rank(("l", 3), 0, 0, False, 3, ctx)
+    next_layer_rank = policy.rank(("l", 5), 0, 0, False, 5, ctx)
+    assert prev_layer_rank < next_layer_rank
 
 
 # ---------------------------------------------------------------------------
@@ -508,15 +607,24 @@ def test_load_never_evicts_pinned_current_step():
     )
 
 
-def test_always_on_hot_never_evicted():
+def test_only_current_step_is_protected_from_eviction():
+    """Only `_step_pinned` (the current step's working set) restricts
+    eviction now -- there is no separate "always-on" protection tier any
+    more (removed per request: the only limit on eviction is the current
+    step's needs; every other resident expert, including ones warmed via
+    `_always_on_experts`, is fair game)."""
     off, cache, _ = _wire(E=8, pool_experts=4)
     cache.load([("layer.0", 0)], horizon=set())
-    cache.pinned_hot.add(("layer.0", 0))
-    # Fill + churn the rest; the hot expert must survive.
     cache.load([("layer.1", g) for g in range(1, 4)], horizon=set())
+    # bump everything except ("layer.0", 0) so it is uniquely least-frequent
+    # and therefore the deterministic LFU eviction victim.
+    for g in range(1, 4):
+        cache.bump("layer.1", [g])
     cache.pin_step(set())
-    cache.load([("layer.1", g) for g in range(4, 7)], horizon=set())
-    assert cache.is_resident("layer.0", 0)
+    cache.load([("layer.1", 4)], horizon=set())
+    assert not cache.is_resident("layer.0", 0), (
+        "no protection tier survives outside _step_pinned any more"
+    )
 
 
 def test_graded_eviction_protects_horizon_as_last_resort():
@@ -531,8 +639,26 @@ def test_graded_eviction_protects_horizon_as_last_resort():
     horizon = {("layer.1", 2), ("layer.1", 3)}
     # Need 2 victims: high-freq non-horizon should still be picked before the
     # low-freq horizon experts (horizon = last resort).
-    victims = cache._pick_victims(2, horizon)
+    victims = cache._pick_victims(2, horizon, cur_layer_idx=0)
     assert set(victims) == {("layer.0", 0), ("layer.0", 1)}
+
+
+def test_horizon_protected_as_last_resort_under_all_policies():
+    """LRU and MRU must also keep horizon experts as a last resort, not just
+    LFU (the only policy this was previously tested against)."""
+    for eviction in (LRUEviction(), MRUEviction()):
+        off, cache, _ = _wire(E=8, pool_experts=4)
+        cache.eviction = eviction
+        cache.load(
+            [("layer.0", 0), ("layer.0", 1), ("layer.1", 2), ("layer.1", 3)],
+            horizon=set(),
+        )
+        # Recency-bump the non-horizon pair so they are not the "oldest"
+        # candidates either -- isolates the horizon tier from recency.
+        cache.bump("layer.0", [0, 1])
+        horizon = {("layer.1", 2), ("layer.1", 3)}
+        victims = cache._pick_victims(2, horizon, cur_layer_idx=0)
+        assert set(victims) == {("layer.0", 0), ("layer.0", 1)}, eviction
 
 
 def test_pool_exhausted_when_all_pinned_raises():
@@ -541,6 +667,34 @@ def test_pool_exhausted_when_all_pinned_raises():
     cache.pin_step({("layer.0", g) for g in range(4)})
     with pytest.raises(RuntimeError, match="pool exhausted"):
         cache.load([("layer.1", 0)], horizon=set())
+
+
+def test_freq_is_global_and_survives_an_evict_reload_cycle():
+    """`freq` is keyed globally (all layers, hit+miss via `bump`), never reset
+    or deleted on eviction -- so a cold-then-hot-again expert's history isn't
+    lost while it's non-resident."""
+    off, cache, _ = _wire(E=8, pool_experts=4)
+    cache.load([("layer.0", 0)], horizon=set())
+    cache.bump("layer.0", [0])
+    cache.bump("layer.0", [0])
+    cache.bump("layer.0", [0])
+    assert cache.freq[("layer.0", 0)] == 3
+
+    # Fill the rest of the pool with keys bumped MORE, so ("layer.0", 0) is
+    # the globally least-frequent resident -- the deterministic LFU victim
+    # once one more slot is needed.
+    cache.load([("layer.1", g) for g in range(3)], horizon=set())
+    for g in range(3):
+        for _ in range(5):
+            cache.bump("layer.1", [g])
+    cache.load([("layer.1", 3)], horizon=set())  # pool full -> forces 1 eviction
+    assert not cache.is_resident("layer.0", 0)
+    assert cache.freq[("layer.0", 0)] == 3, "freq must survive eviction, not reset"
+
+    # Reload it -- prior history must still be there, now incremented further.
+    cache.load([("layer.0", 0)], horizon=set())
+    cache.bump("layer.0", [0])
+    assert cache.freq[("layer.0", 0)] == 4
 
 
 def test_memory_accounting_independent_of_routing():
@@ -840,7 +994,11 @@ def test_prefetch_budget_zero_counted(monkeypatch):
     )
     monkeypatch.setattr(off, "_transfer_budget", lambda *a, **k: 0)
     off._issue_prefetch(
-        "decode", num_tokens=1, num_misses=0, predicted=[("layer.1", 0)]
+        "decode",
+        num_tokens=1,
+        num_misses=0,
+        predicted=[("layer.1", 0)],
+        cur_layer_idx=0,
     )
     assert off.prefetch_budget_zero["decode"] == 1
     assert off.prefetch_queue_exhausted["decode"] == 0
@@ -857,7 +1015,9 @@ def test_prefetch_queue_exhausted_when_candidates_run_out_first(monkeypatch):
     )
     monkeypatch.setattr(off, "_transfer_budget", lambda *a, **k: 100)
     predicted = [("layer.1", 0), ("layer.1", 1)]
-    off._issue_prefetch("decode", num_tokens=1, num_misses=0, predicted=predicted)
+    off._issue_prefetch(
+        "decode", num_tokens=1, num_misses=0, predicted=predicted, cur_layer_idx=0
+    )
     assert off.prefetch_queue_exhausted["decode"] == 1
     assert off.prefetch_budget_limited["decode"] == 0
     assert off.prefetch_loaded == 2
@@ -874,7 +1034,9 @@ def test_prefetch_budget_limited_when_ceiling_hit_first(monkeypatch):
     )
     monkeypatch.setattr(off, "_transfer_budget", lambda *a, **k: 1)
     predicted = [("layer.1", 0), ("layer.1", 1), ("layer.1", 2)]
-    off._issue_prefetch("decode", num_tokens=1, num_misses=0, predicted=predicted)
+    off._issue_prefetch(
+        "decode", num_tokens=1, num_misses=0, predicted=predicted, cur_layer_idx=0
+    )
     assert off.prefetch_budget_limited["decode"] == 1
     assert off.prefetch_queue_exhausted["decode"] == 0
     assert off.prefetch_loaded == 1  # only 1 of 3 candidates got through
@@ -1024,10 +1186,13 @@ def test_pool_wave_sum_equals_full_residency(waves):
     # non-identity slots E..2E-1 — exercising the gather's slot lookup.
     decoy = _MoEModule("decoy", E, w1.shape[1:], w2.shape[1:])
     cache.register_layer(
-        "decoy", decoy, {"w13_weight": torch.zeros_like(w1), "w2_weight": torch.zeros_like(w2)}
+        "decoy",
+        decoy,
+        {"w13_weight": torch.zeros_like(w1), "w2_weight": torch.zeros_like(w2)},
+        0,
     )
     cache.register_layer(
-        "layer.0", module, {"w13_weight": w1.clone(), "w2_weight": w2.clone()}
+        "layer.0", module, {"w13_weight": w1.clone(), "w2_weight": w2.clone()}, 1
     )
     cache.build_pool()
     cache.load([("decoy", g) for g in range(E)], horizon=set())

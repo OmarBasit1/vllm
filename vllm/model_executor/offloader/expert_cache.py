@@ -36,6 +36,7 @@ import heapq
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Generator
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -306,42 +307,164 @@ def create_predictor(name: str, artifacts_dir: str = "") -> ExpertPredictor:
     return _PREDICTOR_REGISTRY[name]()
 
 
+@dataclass(frozen=True)
+class EvictionContext:
+    """Key-independent state for one eviction decision (``_pick_victims``
+    builds one and shares it across every candidate key's ``rank()`` call).
+
+    Attributes:
+        cur_layer_idx: Ordinal of the layer executing right now.
+        num_layers: Total MoE layers, for the cyclic distance modulus.
+        tick: Monotonic step counter (bumped once per ``bump()`` call) --
+            "now", for recency.
+        max_freq: Running max of ``_GlobalExpertCache.freq``, >= 1, for
+            normalizing frequency into ``[0, 1]``.
+    """
+
+    cur_layer_idx: int
+    num_layers: int
+    tick: int
+    max_freq: int
+
+
+def _layer_staleness(layer_idx: int, ctx: EvictionContext) -> float:
+    """Normalized cyclic forward distance from ``ctx.cur_layer_idx`` to
+    ``layer_idx``, in ``[0, 1]``: ~0 = needed next (protect most), 1 = just
+    executed (evict first). ``layer_idx == cur_layer_idx`` (distance 0, same
+    layer as now) also lands near 0 -- a resident-but-not-currently-needed
+    expert of the executing layer is exactly one full pass from its next
+    possible use, the same as any other layer's "just wrapped around" case."""
+    d = (layer_idx - ctx.cur_layer_idx) % ctx.num_layers
+    return d / max(1, ctx.num_layers - 1)
+
+
 class EvictionPolicy(ABC):
     """Pluggable eviction ordering over resident keys."""
 
     @abstractmethod
-    def rank(self, key: Key, freq: int, in_horizon: bool) -> tuple:
+    def rank(
+        self,
+        key: Key,
+        freq: int,
+        last_used: int,
+        in_horizon: bool,
+        layer_idx: int,
+        ctx: EvictionContext,
+    ) -> tuple:
         """Sort key for a resident expert; *smaller ranks are evicted first*."""
         raise NotImplementedError
 
 
 class LFUEviction(EvictionPolicy):
-    """Graded least-frequently-used.
+    """Graded least-frequently-used, optionally blended with layer-distance.
 
     Non-horizon experts are evicted before predicted-soon ("horizon") ones, and
-    within each tier the least-frequently-used goes first. Protecting horizon
+    within each tier a blend of global frequency and layer-distance ranks
+    evictability. ``distance_weight=0`` (default) is textbook graded-LFU: the
+    least-frequently-used goes first, using the GLOBAL frequency (all layers,
+    hits AND misses -- see ``_GlobalExpertCache.bump``), not a
+    residency-scoped count. ``distance_weight>0`` additionally protects
+    experts whose layer is about to execute and prioritizes evicting experts
+    whose layer just executed (see ``_layer_staleness``). Protecting horizon
     experts as a last resort keeps a prefetched expert from being thrown out by
     an intervening layer's miss-load before its own layer runs — unless that
     layer's demand is large enough to exhaust every non-horizon victim, in which
     case a present need correctly outranks a future guess.
     """
 
-    def rank(self, key: Key, freq: int, in_horizon: bool) -> tuple:
-        return (in_horizon, freq)
+    def __init__(self, distance_weight: float = 0.0):
+        if not 0.0 <= distance_weight <= 1.0:
+            raise ValueError(
+                f"eviction distance_weight must be in [0, 1], got {distance_weight}"
+            )
+        self.distance_weight = distance_weight
+
+    def rank(
+        self,
+        key: Key,
+        freq: int,
+        last_used: int,
+        in_horizon: bool,
+        layer_idx: int,
+        ctx: EvictionContext,
+    ) -> tuple:
+        base = freq / ctx.max_freq
+        w = self.distance_weight
+        keep = (
+            base
+            if w == 0.0
+            else (1 - w) * base + w * (1 - _layer_staleness(layer_idx, ctx))
+        )
+        return (in_horizon, keep)
+
+
+class LRUEviction(EvictionPolicy):
+    """Least-recently-used, optionally blended with layer-distance.
+
+    Recency is measured in layer-steps (``_GlobalExpertCache._tick``, bumped
+    once per ``bump()`` call), not wall-clock time. ``distance_weight``
+    semantics mirror ``LFUEviction``.
+    """
+
+    def __init__(self, distance_weight: float = 0.0):
+        if not 0.0 <= distance_weight <= 1.0:
+            raise ValueError(
+                f"eviction distance_weight must be in [0, 1], got {distance_weight}"
+            )
+        self.distance_weight = distance_weight
+
+    def rank(
+        self,
+        key: Key,
+        freq: int,
+        last_used: int,
+        in_horizon: bool,
+        layer_idx: int,
+        ctx: EvictionContext,
+    ) -> tuple:
+        base = last_used / ctx.tick
+        w = self.distance_weight
+        keep = (
+            base
+            if w == 0.0
+            else (1 - w) * base + w * (1 - _layer_staleness(layer_idx, ctx))
+        )
+        return (in_horizon, keep)
+
+
+class MRUEviction(EvictionPolicy):
+    """Most-recently-used: the mirror image of LRU (evict the most recently
+    used first), no distance term -- the deliberate control arm separating
+    "recency direction" from "distance awareness" as independent axes."""
+
+    def rank(
+        self,
+        key: Key,
+        freq: int,
+        last_used: int,
+        in_horizon: bool,
+        layer_idx: int,
+        ctx: EvictionContext,
+    ) -> tuple:
+        return (in_horizon, 1.0 - last_used / ctx.tick)
 
 
 _EVICTION_REGISTRY: dict[str, type[EvictionPolicy]] = {
     "lfu": LFUEviction,
+    "lru": LRUEviction,
+    "mru": MRUEviction,
 }
 
 
-def create_eviction(name: str) -> EvictionPolicy:
+def create_eviction(name: str, distance_weight: float = 0.0) -> EvictionPolicy:
     if name not in _EVICTION_REGISTRY:
         raise ValueError(
             f"Unknown expert-cache eviction policy {name!r}. "
             f"Available: {sorted(_EVICTION_REGISTRY)}"
         )
-    return _EVICTION_REGISTRY[name]()
+    if name == "mru":
+        return MRUEviction()
+    return _EVICTION_REGISTRY[name](distance_weight=distance_weight)
 
 
 def split_hits_misses(
@@ -366,6 +489,7 @@ class _GlobalExpertCache:
     """
 
     _EMA_ALPHA = 0.3  # matches ExpertCacheOffloader._EMA_ALPHA (compute-time side)
+    _DECAY_INTERVAL = 1000  # bump() calls between freq_decay applications
 
     def __init__(
         self,
@@ -375,6 +499,7 @@ class _GlobalExpertCache:
         device: torch.device,
         eviction: EvictionPolicy,
         per_expert_bytes: int,
+        freq_decay: float = 1.0,
     ):
         self.param_names = param_names
         self.pool_experts = pool_experts
@@ -382,6 +507,7 @@ class _GlobalExpertCache:
         self.device = device
         self.eviction = eviction
         self.per_expert_bytes = per_expert_bytes
+        self.freq_decay = freq_decay
         self._cuda = device.type == "cuda"
 
         # Per-layer CPU-pinned expert storage: layer_name -> {param -> (E, *shape)}.
@@ -392,12 +518,20 @@ class _GlobalExpertCache:
         self.pool: dict[str, torch.Tensor] = {}
         # Contiguous per-wave compute buffer (dense rows the kernel sees).
         self.compute_buf: dict[str, torch.Tensor] = {}
+        # layer_name -> ordinal, for the eviction distance term (`_layer_staleness`).
+        self._layer_idx_of: dict[str, int] = {}
 
         self.slot_to_key: list[Key | None] = [None] * pool_experts
         self.key_to_slot: dict[Key, int] = {}
-        self.freq: dict[Key, int] = {}
-        self.pinned_hot: set[Key] = set()  # always-on experts, never evicted
-        self._step_pinned: set[Key] = set()  # current step's working set
+        # Global (all-layer, hit+miss) usage stats feeding eviction ranking --
+        # NOT residency-scoped, and never reset/deleted on eviction, so LFU/LRU
+        # answer "globally hot/recent" even for currently-non-resident experts.
+        self.freq: dict[Key, float] = {}
+        self.last_used: dict[Key, int] = {}
+        self._tick = 0  # monotonic, bumped once per `bump()` call; "now" for LRU/MRU
+        self._max_freq = 0.0  # running max, for normalizing freq into [0, 1]
+        self._step_pinned: set[Key] = set()  # current step's working set --
+        # the ONLY eviction restriction; no separate "always-on" protection tier.
 
         self._copy_stream: torch.cuda.Stream | None = None
 
@@ -425,9 +559,11 @@ class _GlobalExpertCache:
         layer_name: str,
         module: nn.Module,
         cpu_storages: dict[str, torch.Tensor],
+        layer_idx: int,
     ) -> None:
         self.layer_cpu[layer_name] = cpu_storages
         self.layer_module[layer_name] = module
+        self._layer_idx_of[layer_name] = layer_idx
 
     def build_pool(self) -> None:
         """Allocate the shared pool (scattered cache residency) and the contiguous
@@ -464,9 +600,18 @@ class _GlobalExpertCache:
         return (layer, gid) in self.key_to_slot
 
     def bump(self, layer: str, gids: list[int]) -> None:
+        self._tick += 1
+        if self.freq_decay != 1.0 and self._tick % self._DECAY_INTERVAL == 0:
+            for k in self.freq:
+                self.freq[k] *= self.freq_decay
+            self._max_freq *= self.freq_decay
         for g in gids:
             key = (layer, g)
-            self.freq[key] = self.freq.get(key, 0) + 1
+            freq = self.freq.get(key, 0) + 1
+            self.freq[key] = freq
+            self.last_used[key] = self._tick
+            if freq > self._max_freq:
+                self._max_freq = freq
 
     def pin_step(self, keys: set[Key]) -> None:
         self._step_pinned = keys
@@ -475,34 +620,51 @@ class _GlobalExpertCache:
         self._step_pinned = set()
 
     def _evictable_keys(self) -> list[Key]:
-        protected = self.pinned_hot | self._step_pinned
         return [
             self.slot_to_key[s]  # type: ignore[misc]
             for s in range(self.pool_experts)
             if self.slot_to_key[s] is not None
-            and self.slot_to_key[s] not in protected
+            and self.slot_to_key[s] not in self._step_pinned
         ]
 
-    def _pick_victims(self, count: int, horizon: set[Key]) -> list[Key]:
+    def _pick_victims(
+        self, count: int, horizon: set[Key], cur_layer_idx: int
+    ) -> list[Key]:
         """Return up to ``count`` resident keys to evict, most-evictable first."""
         evictable = self._evictable_keys()
+        ctx = EvictionContext(
+            cur_layer_idx=cur_layer_idx,
+            num_layers=max(1, len(self._layer_idx_of)),
+            tick=max(1, self._tick),
+            max_freq=max(1, self._max_freq),
+        )
         return heapq.nsmallest(
             count,
             evictable,
-            key=lambda k: self.eviction.rank(k, self.freq.get(k, 0), k in horizon),
+            key=lambda k: self.eviction.rank(
+                k,
+                self.freq.get(k, 0),
+                self.last_used.get(k, 0),
+                k in horizon,
+                self._layer_idx_of[k[0]],
+                ctx,
+            ),
         )
 
     def _free_slots(self) -> list[int]:
         return [s for s in range(self.pool_experts) if self.slot_to_key[s] is None]
 
-    def load(self, keys: list[Key], horizon: set[Key]) -> "torch.cuda.Event | None":
+    def load(
+        self, keys: list[Key], horizon: set[Key], cur_layer_idx: int = 0
+    ) -> "torch.cuda.Event | None":
         """Make ``keys`` resident, evicting as needed, and return a completion
         event (None on CPU / when nothing to load).
 
-        Victims are drawn only from unpinned, non-current-step slots — so a load
-        can never evict an expert the current step needs, nor an always-on hot
-        expert. The fork-event discipline keeps a copy from overwriting a slot a
-        prior wave's compute is still reading.
+        Victims are drawn only from non-current-step slots (``_step_pinned``)
+        — so a load can never evict an expert the current step needs; every
+        other resident expert is a fair eviction candidate. The fork-event
+        discipline keeps a copy from overwriting a slot a prior wave's compute
+        is still reading.
         """
         to_load = [k for k in keys if k not in self.key_to_slot]
         if not to_load:
@@ -510,14 +672,18 @@ class _GlobalExpertCache:
 
         free = self._free_slots()
         need_evict = max(0, len(to_load) - len(free))
-        victims = self._pick_victims(need_evict, horizon) if need_evict else []
+        victims = (
+            self._pick_victims(need_evict, horizon, cur_layer_idx)
+            if need_evict
+            else []
+        )
         if len(free) + len(victims) < len(to_load):
             # Should not happen: pool_experts >= global_num_experts guarantees a
             # single layer fits, and prefetch is budgeted below that. Surface it.
             raise RuntimeError(
                 f"ExpertCache pool exhausted: need {len(to_load)} slots but only "
                 f"{len(free) + len(victims)} available (pinned "
-                f"{len(self.pinned_hot) + len(self._step_pinned)})."
+                f"{len(self._step_pinned)})."
             )
         for vkey in victims:
             vslot = self.key_to_slot.pop(vkey)
@@ -613,10 +779,17 @@ class ExpertCacheOffloader(BaseOffloader):
         prefetch_horizon: How many layers ahead to prefetch.
         budget_gb: If > 0, assert measured GPU-resident pool bytes are within
             tolerance (memory-parity check). 0 disables.
-        eviction_policy: Eviction policy identifier (``"lfu"``).
+        eviction_policy: Eviction policy identifier (``"lfu"``, ``"lru"``, or
+            ``"mru"``).
         predictor: Predictor identifier (``"first_k"``).
         budget_safety: Fraction of the estimated copy-free window trusted for
             speculative prefetch (see ``_transfer_budget``).
+        eviction_distance_weight: Blend weight (``[0, 1]``) for layer-distance
+            awareness in ``lfu``/``lru`` (ignored by ``mru``); 0 = textbook
+            policy, see ``LFUEviction``/``LRUEviction``.
+        eviction_freq_decay: Geometric decay applied to all ``freq`` counts
+            every ``_GlobalExpertCache._DECAY_INTERVAL`` steps; 1.0 (default)
+            disables decay and reproduces the original never-decaying counts.
         offload_params: Parameter name segments to target (empty = all per-expert
             params of each MoE layer).
     """
@@ -635,6 +808,8 @@ class ExpertCacheOffloader(BaseOffloader):
         predictor: str = "first_k",
         predictor_artifacts: str = "",
         budget_safety: float = 0.9,
+        eviction_distance_weight: float = 0.0,
+        eviction_freq_decay: float = 1.0,
         offload_params: set[str] | None = None,
     ):
         if waves not in (1, 2):
@@ -653,7 +828,10 @@ class ExpertCacheOffloader(BaseOffloader):
         self.prefetch_horizon = max(0, prefetch_horizon)
         self.budget_gb = budget_gb
         self.predictor = create_predictor(predictor, artifacts_dir=predictor_artifacts)
-        self.eviction = create_eviction(eviction_policy)
+        self.eviction = create_eviction(
+            eviction_policy, distance_weight=eviction_distance_weight
+        )
+        self._eviction_freq_decay = eviction_freq_decay
         self.offload_params = offload_params or set()
 
         self._param_offloaders: dict[str, dict[str, _CpuParamOffloader]] = {}
@@ -861,6 +1039,7 @@ class ExpertCacheOffloader(BaseOffloader):
                     device=device,
                     eviction=self.eviction,
                     per_expert_bytes=per_expert_bytes,
+                    freq_decay=self._eviction_freq_decay,
                 )
             elif shapes != expert_shapes:
                 raise NotImplementedError(
@@ -869,7 +1048,9 @@ class ExpertCacheOffloader(BaseOffloader):
                     f"expected {expert_shapes}."
                 )
 
-            cache.register_layer(layer_name, routed_experts, cpu_storages)
+            cache.register_layer(
+                layer_name, routed_experts, cpu_storages, self._layer_index[layer_name]
+            )
 
         if cache is None:
             return
@@ -882,8 +1063,10 @@ class ExpertCacheOffloader(BaseOffloader):
         atexit.register(self._log_final_stats)
 
     def _warm_always_on(self) -> None:
-        """Pin architecturally always-activated routed experts (empty on a
-        load-balanced router). Hook returns [] by default."""
+        """Pre-load architecturally always-activated routed experts (empty on
+        a load-balanced router; hook returns [] by default). This only seeds
+        initial residency -- it grants no eviction protection beyond the
+        current step's working set, same as any other resident expert."""
         assert self._cache is not None
         for layer_name in self._layer_order:
             always_on = self._always_on_experts(layer_name)
@@ -891,7 +1074,6 @@ class ExpertCacheOffloader(BaseOffloader):
                 continue
             keys = [(layer_name, g) for g in always_on]
             self._cache.load(keys, horizon=set())
-            self._cache.pinned_hot.update(keys)
 
     def _always_on_experts(self, layer_name: str) -> list[int]:
         return []
@@ -1151,7 +1333,7 @@ class ExpertCacheOffloader(BaseOffloader):
         # prefetch queue both derive from it.
         predicted = self._predict_upcoming(cur_idx)
         horizon = set(predicted)
-        miss_event = cache.load([(layer, g) for g in misses], horizon)
+        miss_event = cache.load([(layer, g) for g in misses], horizon, cur_idx)
         self.bytes_streamed += len(misses) * cache.per_expert_bytes
 
         # Each wave gets its own (start, end) event pair bracketing only its
@@ -1214,7 +1396,7 @@ class ExpertCacheOffloader(BaseOffloader):
                 self._timing_would_have_discarded_count[bucket] += 1
             pending.append((bucket, num_tokens, compute_events))
 
-        self._issue_prefetch(bucket, num_tokens, len(misses), predicted)
+        self._issue_prefetch(bucket, num_tokens, len(misses), predicted, cur_idx)
         if cuda:
             done_ev = torch.cuda.Event(enable_timing=True)
             done_ev.record()
@@ -1229,6 +1411,7 @@ class ExpertCacheOffloader(BaseOffloader):
         num_tokens: int,
         num_misses: int,
         predicted: list[Key],
+        cur_layer_idx: int,
     ) -> None:
         assert self._cache is not None
         budget = self._transfer_budget(bucket, num_tokens, num_misses)
@@ -1258,7 +1441,7 @@ class ExpertCacheOffloader(BaseOffloader):
             self.prefetch_queue_exhausted[bucket] += 1
         if not batch:
             return
-        ev = self._cache.load(batch, horizon)
+        ev = self._cache.load(batch, horizon, cur_layer_idx)
         self.prefetch_loaded += len(batch)
         self.bucket_stats[bucket]["prefetch_loaded"] += len(batch)
         self.bytes_streamed += len(batch) * self._cache.per_expert_bytes
