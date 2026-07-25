@@ -663,8 +663,11 @@ class ExpertCacheOffloader(BaseOffloader):
         # (not a single slot) so a sample that isn't ready yet is retried next
         # time, never silently discarded -- CUDA events recorded on the same
         # stream complete in program order, so checking only the oldest
-        # pending entry per layer is sufficient and correct.
-        self._pending_timing: dict[str, deque[tuple]] = {}
+        # pending entry per layer is sufficient and correct. Each sample's
+        # event list has one (start, end) pair per wave -- under waves=2 this
+        # excludes the wait for the miss-copy between wave 0 and wave 1, so
+        # only genuine compute time is summed (see `iter_expert_waves`).
+        self._pending_timing: dict[str, deque[tuple[str, int, list]]] = {}
         self._prev_prefetch_event: "torch.cuda.Event | None" = None
 
         # Timing-accuracy diagnostics (2026-07-24): how many compute-timing
@@ -678,6 +681,20 @@ class ExpertCacheOffloader(BaseOffloader):
             "prefill": 0,
             "decode": 0,
         }
+
+        # Inter-layer gap: the transfer budget only ever counted THIS layer's
+        # own compute time as available slack, ignoring the (much larger)
+        # window between "this layer's prefetch decision" and "the next
+        # layer actually needs its experts" -- attention, norms, and any
+        # other non-MoE work in between. Measured the same never-discard way
+        # as compute timing, via one CUDA event pair spanning consecutive
+        # `iter_expert_waves` calls, and folded into `_transfer_budget` so
+        # that real (measured) idle copy-engine time unlocks more prefetch.
+        self._layer_gap_ema: dict[str, float | None] = {"prefill": None, "decode": None}
+        self._pending_gap_timing: deque[tuple] = deque()
+        self._last_step_done_ev: "torch.cuda.Event | None" = None
+        self._last_step_bucket: str | None = None
+        self._gap_resolved_count: dict[str, int] = {"prefill": 0, "decode": 0}
 
         self._resident_bytes = 0
         self.hot_hits = 0
@@ -991,7 +1008,8 @@ class ExpertCacheOffloader(BaseOffloader):
         per_tok = self._layer_time_ema[bucket]
         if per_tok is None:
             return 0  # not warmed yet: no speculation until we can size it
-        t_compute = per_tok * num_tokens
+        gap_ms = self._layer_gap_ema[bucket] or 0.0
+        t_compute = per_tok * num_tokens + gap_ms
         t_miss = num_misses * t_per_expert_ms
         slack_ms = (t_compute - t_miss) * self._BUDGET_SAFETY
         if slack_ms <= 0:
@@ -1003,11 +1021,11 @@ class ExpertCacheOffloader(BaseOffloader):
         if not pending:
             return
         while pending:
-            bucket, num_tokens, start, end = pending[0]
-            if not end.query():
+            bucket, num_tokens, events = pending[0]
+            if not events[-1][1].query():
                 break  # not ready yet; leave it queued, retry next time
             pending.popleft()
-            elapsed = start.elapsed_time(end)
+            elapsed = sum(start.elapsed_time(end) for start, end in events)
             per_tok = elapsed / max(1, num_tokens)
             prev = self._layer_time_ema[bucket]
             self._layer_time_ema[bucket] = (
@@ -1016,6 +1034,22 @@ class ExpertCacheOffloader(BaseOffloader):
                 else (1 - self._EMA_ALPHA) * prev + self._EMA_ALPHA * per_tok
             )
             self._timing_resolved_count[bucket] += 1
+
+    def _consume_gap_timing(self) -> None:
+        pending = self._pending_gap_timing
+        while pending:
+            bucket, start, end = pending[0]
+            if not end.query():
+                break  # not ready yet; leave it queued, retry next time
+            pending.popleft()
+            elapsed = start.elapsed_time(end)
+            prev = self._layer_gap_ema[bucket]
+            self._layer_gap_ema[bucket] = (
+                elapsed
+                if prev is None
+                else (1 - self._EMA_ALPHA) * prev + self._EMA_ALPHA * elapsed
+            )
+            self._gap_resolved_count[bucket] += 1
 
     def iter_expert_waves(
         self,
@@ -1034,8 +1068,17 @@ class ExpertCacheOffloader(BaseOffloader):
             torch.cuda.current_stream().wait_event(self._prev_prefetch_event)
             self._prev_prefetch_event = None
         self._consume_timing(layer)
+        self._consume_gap_timing()
         if cuda:
             cache.drain_transfer_timing()
+
+        if cuda and self._last_step_done_ev is not None:
+            gap_end_ev = torch.cuda.Event(enable_timing=True)
+            gap_end_ev.record()
+            self._pending_gap_timing.append(
+                (self._last_step_bucket, self._last_step_done_ev, gap_end_ev)
+            )
+            self._last_step_done_ev = None
 
         cur_idx = self._layer_index[layer]
         bucket = self._batch_bucket(topk_ids)
@@ -1061,42 +1104,72 @@ class ExpertCacheOffloader(BaseOffloader):
         miss_event = cache.load([(layer, g) for g in misses], horizon)
         self.bytes_streamed += len(misses) * cache.per_expert_bytes
 
-        start_ev = end_ev = None
-        if cuda:
-            start_ev = torch.cuda.Event(enable_timing=True)
-            end_ev = torch.cuda.Event(enable_timing=True)
+        # Each wave gets its own (start, end) event pair bracketing only its
+        # compute kernel(s). Under waves=2 this deliberately excludes the
+        # wait_event for the miss-copy between wave 0 and wave 1 -- that wait
+        # is idle time, not compute, and including it would inflate
+        # `_layer_time_ema` (it used to, by ~2x whenever a step mixed hits
+        # and misses, see git history) and make `_transfer_budget` believe
+        # there was far more spare time than genuinely existed.
+        compute_events: list[tuple] = []
+
+        def _wave_events() -> tuple:
+            if not cuda:
+                return None, None
+            return (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+            )
 
         if self.waves == 1 or not hits:
             if cuda and miss_event is not None:
                 torch.cuda.current_stream().wait_event(miss_event)
+            start_ev, end_ev = _wave_events()
             cache.publish(layer, needed)
             if start_ev is not None:
                 start_ev.record()
             self.wave_count += 1
             yield
+            if end_ev is not None:
+                end_ev.record()
+                compute_events.append((start_ev, end_ev))
         else:
+            start_ev0, end_ev0 = _wave_events()
             cache.publish(layer, hits)
-            if start_ev is not None:
-                start_ev.record()
+            if start_ev0 is not None:
+                start_ev0.record()
             self.wave_count += 1
             yield  # wave 0 (hits) overlaps the miss copy
+            if end_ev0 is not None:
+                end_ev0.record()
+                compute_events.append((start_ev0, end_ev0))
             if cuda and miss_event is not None:
                 torch.cuda.current_stream().wait_event(miss_event)
+            start_ev1, end_ev1 = _wave_events()
             cache.publish(layer, misses)
+            if start_ev1 is not None:
+                start_ev1.record()
             self.wave_count += 1
             yield
+            if end_ev1 is not None:
+                end_ev1.record()
+                compute_events.append((start_ev1, end_ev1))
 
-        if end_ev is not None:
-            end_ev.record()
+        if compute_events:
             pending = self._pending_timing.setdefault(layer, deque())
             if pending:
                 # Under the old single-slot design (a plain dict entry
                 # overwritten each call) this in-flight sample would have
                 # been silently discarded rather than retried next time.
                 self._timing_would_have_discarded_count[bucket] += 1
-            pending.append((bucket, num_tokens, start_ev, end_ev))
+            pending.append((bucket, num_tokens, compute_events))
 
         self._issue_prefetch(bucket, num_tokens, len(misses), predicted)
+        if cuda:
+            done_ev = torch.cuda.Event(enable_timing=True)
+            done_ev.record()
+            self._last_step_done_ev = done_ev
+            self._last_step_bucket = bucket
         cache.unpin_step()
         self._maybe_log_stats(cur_idx)
 
@@ -1190,6 +1263,8 @@ class ExpertCacheOffloader(BaseOffloader):
                 would_discard / resolved if resolved else 0.0
             ),
             "current_ema_ms_per_token": self._layer_time_ema[bucket] or 0.0,
+            "gap_resolved": self._gap_resolved_count[bucket],
+            "current_gap_ema_ms": self._layer_gap_ema[bucket] or 0.0,
         }
 
     def _transfer_calibration_stats(self) -> dict[str, float]:
@@ -1270,11 +1345,13 @@ class ExpertCacheOffloader(BaseOffloader):
         logger.info(
             "[ExpertCacheOffloader] timing accuracy (pass=%d) decode: "
             "resolved=%d would_have_discarded=%d (rate=%.3f) "
-            "ema_ms_per_tok=%.4f | transfer: startup_ms_per_expert=%.4f "
+            "ema_ms_per_tok=%.4f gap_ema_ms=%.4f (gap_resolved=%d) | "
+            "transfer: startup_ms_per_expert=%.4f "
             "real_avg_ms_per_expert=%.4f effective_ms_per_expert=%.4f (n=%d)",
             self._pass_count,
             td["resolved"], td["would_have_discarded"],
             td["would_have_discarded_rate"], td["current_ema_ms_per_token"],
+            td["current_gap_ema_ms"], td["gap_resolved"],
             xfer["startup_ms_per_expert"], xfer["real_avg_ms_per_expert"],
             xfer["effective_ms_per_expert"], xfer["real_sample_experts"],
         )

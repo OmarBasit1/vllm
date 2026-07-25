@@ -453,6 +453,26 @@ def test_waves2_hits_then_misses_each_expert_once():
     _assert_resident_and_correct(mods[0], cache, 0, [5, 6])
 
 
+@requires_cuda
+def test_waves2_mixed_hits_misses_times_each_wave_separately():
+    """The compute-timing sample for a mixed hits+misses step under waves=2
+    must bracket each wave's compute separately (one (start, end) pair per
+    wave), so the wait for the miss-copy between wave 0 and wave 1 is never
+    included in the measured compute time -- that wait used to get folded
+    into a single start/end bracket spanning both waves, inflating
+    `_layer_time_ema` by roughly 2x and making `_transfer_budget` overestimate
+    available prefetch slack."""
+    off, cache, mods = _wire(E=8, pool_experts=8, waves=2)
+    cache.load([("layer.0", 1), ("layer.0", 2)], horizon=set())
+    topk_ids = torch.tensor([[1, 2], [5, 6]], device=DEVICE)
+    list(off.iter_expert_waves(mods[0], topk_ids))
+
+    pending = off._pending_timing["layer.0"]
+    assert len(pending) == 1
+    _, _, events = pending[0]
+    assert len(events) == 2  # one pair for wave 0 (hits), one for wave 1 (misses)
+
+
 def test_waves2_no_hits_degenerates_to_single_wave():
     off, _, mods = _wire(E=8, pool_experts=8, waves=2)
     topk_ids = torch.tensor([[4, 5]], device=DEVICE)
@@ -553,6 +573,53 @@ def test_transfer_budget_zero_when_misses_exceed_compute_window():
     assert off._transfer_budget("prefill", num_tokens=100, num_misses=0) > 0
 
 
+def test_transfer_budget_includes_interlayer_gap_ema():
+    """`_transfer_budget` must count the measured inter-layer gap (attention
+    + other non-MoE work between this layer's prefetch decision and the next
+    layer's need) as additional available slack, not just this layer's own
+    compute time -- that gap was previously invisible/unused."""
+    off, _, _ = _wire()
+    off._t_per_expert_ms = 1.0
+    off._layer_time_ema["prefill"] = 0.1  # 100*0.1=10ms window from compute alone
+    without_gap = off._transfer_budget("prefill", num_tokens=100, num_misses=0)
+    off._layer_gap_ema["prefill"] = 50.0  # a large measured inter-layer gap
+    with_gap = off._transfer_budget("prefill", num_tokens=100, num_misses=0)
+    assert with_gap > without_gap
+
+
+def test_consume_gap_timing_retries_unready_sample_instead_of_discarding():
+    off, _, _ = _wire()
+    start, end = _FakeEvent(ready=False, elapsed=5.0), _FakeEvent(ready=False)
+    off._pending_gap_timing.append(("decode", start, end))
+
+    off._consume_gap_timing()
+    assert off._gap_resolved_count["decode"] == 0
+    assert len(off._pending_gap_timing) == 1
+    assert off._layer_gap_ema["decode"] is None
+
+    end.ready = True
+    off._consume_gap_timing()
+    assert off._gap_resolved_count["decode"] == 1
+    assert len(off._pending_gap_timing) == 0
+    assert off._layer_gap_ema["decode"] == pytest.approx(5.0)
+
+
+@requires_cuda
+def test_iter_expert_waves_measures_real_interlayer_gap():
+    """Two consecutive `iter_expert_waves` calls (as happens once per layer
+    in a real forward pass) must produce one resolved gap sample spanning
+    from the first call's prefetch-issue point to the second call's entry."""
+    off, cache, mods = _wire(num_layers=2, E=8, pool_experts=8, waves=1)
+    list(off.iter_expert_waves(mods[0], torch.tensor([[0, 1]], device=DEVICE)))
+    assert off._last_step_done_ev is not None
+    list(off.iter_expert_waves(mods[1], torch.tensor([[2, 3]], device=DEVICE)))
+    torch.cuda.synchronize()
+    off._consume_gap_timing()
+    assert off._gap_resolved_count["decode"] == 1
+    assert off._layer_gap_ema["decode"] is not None
+    assert off._layer_gap_ema["decode"] >= 0.0
+
+
 def test_effective_transfer_rate_falls_back_to_startup_calibration():
     """Before any real transfer has been measured (`real_ms_per_expert_ema`
     is None), `_transfer_budget` must use the once-at-startup calibration."""
@@ -620,7 +687,7 @@ def test_consume_timing_retries_unready_sample_instead_of_discarding():
     single-slot (plain dict, overwritten each call) design had."""
     off, _, _ = _wire()
     start, end = _FakeEvent(ready=False), _FakeEvent(ready=False)
-    off._pending_timing["layer.0"] = deque([("decode", 4, start, end)])
+    off._pending_timing["layer.0"] = deque([("decode", 4, [(start, end)])])
 
     off._consume_timing("layer.0")
     assert off._timing_resolved_count["decode"] == 0
@@ -642,12 +709,13 @@ def test_pending_timing_write_site_detects_would_have_discarded():
     retries the old sample AND counts the near-miss."""
     off, cache, mods = _wire(E=8, pool_experts=8, waves=1)
     stuck_start, stuck_end = _FakeEvent(ready=False), _FakeEvent(ready=False)
-    off._pending_timing["layer.0"] = deque([("decode", 1, stuck_start, stuck_end)])
+    off._pending_timing["layer.0"] = deque([("decode", 1, [(stuck_start, stuck_end)])])
 
     list(off.iter_expert_waves(mods[0], torch.tensor([[0, 1]], device=DEVICE)))
 
     pending = off._pending_timing["layer.0"]
-    assert any(entry[3] is stuck_end for entry in pending)  # not discarded
+    # not discarded
+    assert any(stuck_end in (e for _, e in entry[2]) for entry in pending)
     assert off._timing_would_have_discarded_count["decode"] == 1
 
 
@@ -669,7 +737,7 @@ def test_drain_transfer_timing_accumulates_real_load_time():
 def test_timing_diagnostics_exposed_in_get_stats():
     off, _, _ = _wire()
     off._pending_timing["layer.0"] = deque(
-        [("decode", 2, _FakeEvent(ready=True, elapsed=2.0), _FakeEvent(ready=True))]
+        [("decode", 2, [(_FakeEvent(ready=True, elapsed=2.0), _FakeEvent(ready=True))])]
     )
     off._consume_timing("layer.0")
     stats = off.get_stats()
