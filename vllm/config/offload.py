@@ -123,16 +123,17 @@ class ExpertCacheOffloadConfig:
     UVA baseline's `--cpu-offload-gb` budget instead of deriving `cache_capacity`
     by hand. Default 0 disables the check."""
 
-    eviction_policy: EvictionPolicy = "lfu"
+    eviction_policy: EvictionPolicy = "lru"
     """Eviction policy for the shared pool. All three keep predicted-soon
     ("horizon") experts as a last resort (evicted only if every other
     resident expert is exhausted first) and can never evict the current
-    step's working set -- no other eviction restriction applies. "lfu"
-    (default): graded least-frequently-used, using GLOBAL (all-layer,
-    hit+miss) frequency, not a residency-scoped count. "lru": graded
-    least-recently-used (recency in layer-steps, not wall-clock). "mru":
-    most-recently-used (the mirror image of "lru"; no distance awareness,
-    see `eviction_distance_weight`)."""
+    step's working set -- no other eviction restriction applies. "lru"
+    (default): graded least-recently-used (recency in layer-steps, not
+    wall-clock); beat graded "lfu" on both decode hit_rate and ITL in the
+    Phase 6 eviction ablation. "lfu": graded least-frequently-used, using
+    GLOBAL (all-layer, hit+miss) frequency, not a residency-scoped count.
+    "mru": most-recently-used (the mirror image of "lru"; no distance
+    awareness, see `eviction_distance_weight`)."""
 
     predictor: str = "hybrid"
     """Predictor identifier. "first_k" statically predicts global expert ids
