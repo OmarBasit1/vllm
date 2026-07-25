@@ -615,13 +615,14 @@ class ExpertCacheOffloader(BaseOffloader):
             tolerance (memory-parity check). 0 disables.
         eviction_policy: Eviction policy identifier (``"lfu"``).
         predictor: Predictor identifier (``"first_k"``).
+        budget_safety: Fraction of the estimated copy-free window trusted for
+            speculative prefetch (see ``_transfer_budget``).
         offload_params: Parameter name segments to target (empty = all per-expert
             params of each MoE layer).
     """
 
     _BUDGET_TOLERANCE = 0.15
     _EMA_ALPHA = 0.3
-    _BUDGET_SAFETY = 0.9
 
     def __init__(
         self,
@@ -633,10 +634,19 @@ class ExpertCacheOffloader(BaseOffloader):
         eviction_policy: str = "lfu",
         predictor: str = "first_k",
         predictor_artifacts: str = "",
+        budget_safety: float = 0.9,
         offload_params: set[str] | None = None,
     ):
         if waves not in (1, 2):
             raise ValueError(f"expert-cache waves must be 1 or 2, got {waves}")
+        # Fraction of the estimated copy-free window (last-wave compute + the
+        # inter-layer gap, see `_transfer_budget`) actually trusted for
+        # prefetch; `1 - budget_safety` is held back as an unused buffer
+        # against the estimate being wrong. Swept empirically (exp16/exp17):
+        # low values (~0.1-0.3) leave the prefetch channel almost entirely
+        # closed; ~0.7-0.9 opens it fully, where the `hybrid` predictor pulls
+        # decisively ahead of `first_k` on both hit_rate and latency.
+        self._budget_safety = budget_safety
         self.pool_experts = pool_experts
         self.waves = waves
         self.predict_k = predict_k
@@ -1040,7 +1050,7 @@ class ExpertCacheOffloader(BaseOffloader):
         if last_wave is None:
             last_wave = self._layer_time_ema[bucket]
         gap_ms = self._layer_gap_ema[bucket] or 0.0
-        window_ms = (last_wave * num_tokens + gap_ms) * self._BUDGET_SAFETY
+        window_ms = (last_wave * num_tokens + gap_ms) * self._budget_safety
         if window_ms <= 0:
             return 0
         return int(window_ms / t_per_expert_ms)

@@ -127,20 +127,32 @@ class ExpertCacheOffloadConfig:
     """Eviction policy for the shared pool. Only "lfu" is shipped (graded:
     predicted-soon experts are evicted only as a last resort)."""
 
-    predictor: str = "first_k"
+    predictor: str = "hybrid"
     """Predictor identifier. "first_k" statically predicts global expert ids
     0..predict_k-1 for every layer and request, with no router-logit
     awareness. "hybrid" predicts layer L's experts from an MLP conditioned on
     layer L-1's hidden state (see `predictor_artifacts`), falling back to a
     per-layer unconditional expert-frequency marginal wherever no L-1 hidden
     has been observed yet (layer 0, or a layer beyond the 1-hop lookahead the
-    MLP was trained for)."""
+    MLP was trained for). Default "hybrid": at budget_safety=0.9 it beat
+    "first_k" decisively (+4.8pp hit_rate, -14% ITL; see exp17) once the
+    prefetch channel is open. Requires `predictor_artifacts`."""
 
     predictor_artifacts: str = ""
     """Directory of trained predictor artifacts, required when `predictor`
     is "hybrid". Expects `<dir>/markov_table.npz` (per-layer expert-frequency
     marginals) and `<dir>/mlp_ckpts/raw_hidden/layer_{L:02d}/best_model.pt`
     for each layer L with a trained MLP. Ignored by "first_k"."""
+
+    budget_safety: float = Field(default=0.9, gt=0)
+    """Fraction of the estimated copy-free window (this layer's last-wave
+    compute time plus the measured inter-layer gap until the next layer's
+    router output) trusted for speculative prefetch; `1 - budget_safety` is
+    held back as an unused buffer against the estimate being wrong. Swept
+    empirically (exp16/exp17): ~0.1-0.3 leaves the prefetch channel almost
+    entirely closed regardless of predictor; ~0.7-0.9 opens it fully, where
+    "hybrid" pulls decisively ahead of "first_k" on both hit_rate and
+    latency. Default 0.9 (the value used in that winning trial)."""
 
     offload_params: set[str] = Field(default_factory=set)
     """The set of parameter name segments to target for expert caching.

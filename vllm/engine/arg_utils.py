@@ -535,6 +535,7 @@ class EngineArgs:
     expert_cache_eviction_policy: str = ExpertCacheOffloadConfig.eviction_policy
     expert_cache_predictor: str = ExpertCacheOffloadConfig.predictor
     expert_cache_predictor_artifacts: str = ExpertCacheOffloadConfig.predictor_artifacts
+    expert_cache_budget_safety: float = ExpertCacheOffloadConfig.budget_safety
     expert_cache_params: set[str] = get_field(
         ExpertCacheOffloadConfig, "offload_params"
     )
@@ -1289,6 +1290,10 @@ class EngineArgs:
         offload_group.add_argument(
             "--expert-cache-predictor-artifacts",
             **expert_cache_kwargs["predictor_artifacts"],
+        )
+        offload_group.add_argument(
+            "--expert-cache-budget-safety",
+            **expert_cache_kwargs["budget_safety"],
         )
         offload_group.add_argument(
             "--expert-cache-params",
@@ -2413,6 +2418,7 @@ class EngineArgs:
                 eviction_policy=self.expert_cache_eviction_policy,
                 predictor=self.expert_cache_predictor,
                 predictor_artifacts=self.expert_cache_predictor_artifacts,
+                budget_safety=self.expert_cache_budget_safety,
                 offload_params=self.expert_cache_params,
             ),
         )
