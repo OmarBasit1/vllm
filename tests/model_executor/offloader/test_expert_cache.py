@@ -563,14 +563,48 @@ def test_batch_bucket_prefill_vs_decode_without_forward_context():
     assert off._batch_bucket(torch.zeros(32, 2, device=DEVICE)) == "prefill"
 
 
-def test_transfer_budget_zero_when_misses_exceed_compute_window():
+def test_transfer_budget_zero_until_warmed_then_sizes_to_free_window():
+    """The budget is 0 until the compute EMA warms, then sizes to the
+    copy-free window (last-wave compute + gap). `num_misses` no longer
+    subtracts from it -- the reactive misses are excluded by construction
+    (they finish before the last wave starts), so the budget is independent
+    of how many misses this step had."""
     off, _, _ = _wire()
     off._t_per_expert_ms = 1.0
     off._layer_time_ema["prefill"] = None  # not warmed -> no speculation
     assert off._transfer_budget("prefill", num_tokens=100, num_misses=10) == 0
-    off._layer_time_ema["prefill"] = 0.5  # 100*0.5=50ms window
-    assert off._transfer_budget("prefill", num_tokens=100, num_misses=200) == 0  # miss>window
-    assert off._transfer_budget("prefill", num_tokens=100, num_misses=0) > 0
+    off._layer_time_ema["prefill"] = 0.5  # falls back to this until last-wave warms
+    # A huge miss count must NOT zero the budget any more.
+    many = off._transfer_budget("prefill", num_tokens=100, num_misses=200)
+    none = off._transfer_budget("prefill", num_tokens=100, num_misses=0)
+    assert many > 0
+    assert many == none  # budget independent of num_misses
+
+
+def test_transfer_budget_sizes_to_last_wave_not_total_compute():
+    """Once the last-wave EMA is warm, the budget uses it (the copy-free
+    window is only the last wave's compute + gap), NOT the full-step compute
+    EMA -- so a small last wave caps the budget below what total compute
+    would allow, even when total compute is large."""
+    off, _, _ = _wire()
+    off._t_per_expert_ms = 1.0
+    off._layer_time_ema["prefill"] = 1.0  # large total-step compute
+    off._last_wave_time_ema["prefill"] = 0.1  # but the last wave is small
+    budget = off._transfer_budget("prefill", num_tokens=100, num_misses=0)
+    # window = last_wave(0.1) * 100 * 0.9 safety = 9 experts, not 90.
+    assert budget == 9
+
+
+def test_consume_timing_tracks_last_wave_separately():
+    """`_consume_timing` must feed BOTH the total-compute EMA (sum of all
+    waves) and the last-wave EMA (only the final wave's pair)."""
+    off, _, _ = _wire()
+    wave0 = (_FakeEvent(ready=True, elapsed=3.0), _FakeEvent(ready=True))
+    wave1 = (_FakeEvent(ready=True, elapsed=1.0), _FakeEvent(ready=True))
+    off._pending_timing["layer.0"] = deque([("decode", 1, [wave0, wave1])])
+    off._consume_timing("layer.0")
+    assert off._layer_time_ema["decode"] == pytest.approx(4.0)  # 3+1 summed
+    assert off._last_wave_time_ema["decode"] == pytest.approx(1.0)  # last only
 
 
 def test_transfer_budget_includes_interlayer_gap_ema():

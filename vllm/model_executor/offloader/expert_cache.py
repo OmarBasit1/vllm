@@ -696,6 +696,20 @@ class ExpertCacheOffloader(BaseOffloader):
         self._last_step_bucket: str | None = None
         self._gap_resolved_count: dict[str, int] = {"prefill": 0, "decode": 0}
 
+        # Last-wave compute EMA: the copy engine is free for prefetch only
+        # AFTER this layer's reactive misses are resident, which (in every
+        # branch of `iter_expert_waves`) is exactly when the LAST wave starts
+        # -- `wait_event(miss_event)` always precedes it. So the real free
+        # window is `last_wave_compute + gap`, and `_transfer_budget` sizes
+        # prefetch to that instead of `total_compute - t_miss`. This both is
+        # more accurate (no fragile t_miss cancellation) and bounds prefetch
+        # so it finishes before the NEXT layer's misses contend for the
+        # single shared copy stream.
+        self._last_wave_time_ema: dict[str, float | None] = {
+            "prefill": None,
+            "decode": None,
+        }
+
         self._resident_bytes = 0
         self.hot_hits = 0
         self.cold_streamed = 0
@@ -1002,19 +1016,34 @@ class ExpertCacheOffloader(BaseOffloader):
         return self._t_per_expert_ms
 
     def _transfer_budget(self, bucket: str, num_tokens: int, num_misses: int) -> int:
+        """Size speculative prefetch to the copy-engine-free window.
+
+        That window is `last_wave_compute + inter_layer_gap`: the reactive
+        misses are already resident before the last wave starts (every branch
+        of `iter_expert_waves` does `wait_event(miss_event)` before it), so
+        the copy stream is idle for exactly the last wave's compute plus the
+        gap until the next layer's router output. No `num_misses` term is
+        subtracted -- the miss-loading window is excluded by construction, not
+        by arithmetic -- which also stops this layer's prefetch from being
+        sized to spill past the gap and contend with the next layer's misses
+        on the single shared copy stream. `num_misses` is retained for the
+        caller/diagnostics but no longer used here.
+        """
         t_per_expert_ms = self._effective_t_per_expert_ms()
         if t_per_expert_ms <= 0:
             return 0
-        per_tok = self._layer_time_ema[bucket]
-        if per_tok is None:
+        # Fall back to the total-compute EMA until the last-wave EMA warms up;
+        # `_layer_time_ema is None` is the "not warmed at all" gate.
+        if self._layer_time_ema[bucket] is None:
             return 0  # not warmed yet: no speculation until we can size it
+        last_wave = self._last_wave_time_ema[bucket]
+        if last_wave is None:
+            last_wave = self._layer_time_ema[bucket]
         gap_ms = self._layer_gap_ema[bucket] or 0.0
-        t_compute = per_tok * num_tokens + gap_ms
-        t_miss = num_misses * t_per_expert_ms
-        slack_ms = (t_compute - t_miss) * self._BUDGET_SAFETY
-        if slack_ms <= 0:
+        window_ms = (last_wave * num_tokens + gap_ms) * self._BUDGET_SAFETY
+        if window_ms <= 0:
             return 0
-        return int(slack_ms / t_per_expert_ms)
+        return int(window_ms / t_per_expert_ms)
 
     def _consume_timing(self, layer: str) -> None:
         pending = self._pending_timing.get(layer)
@@ -1032,6 +1061,17 @@ class ExpertCacheOffloader(BaseOffloader):
                 per_tok
                 if prev is None
                 else (1 - self._EMA_ALPHA) * prev + self._EMA_ALPHA * per_tok
+            )
+            # The last wave is the one whose compute overlaps the copy-free
+            # window (it starts only after this layer's misses are resident).
+            last_start, last_end = events[-1]
+            last_per_tok = last_start.elapsed_time(last_end) / max(1, num_tokens)
+            last_prev = self._last_wave_time_ema[bucket]
+            self._last_wave_time_ema[bucket] = (
+                last_per_tok
+                if last_prev is None
+                else (1 - self._EMA_ALPHA) * last_prev
+                + self._EMA_ALPHA * last_per_tok
             )
             self._timing_resolved_count[bucket] += 1
 
@@ -1263,6 +1303,9 @@ class ExpertCacheOffloader(BaseOffloader):
                 would_discard / resolved if resolved else 0.0
             ),
             "current_ema_ms_per_token": self._layer_time_ema[bucket] or 0.0,
+            "current_last_wave_ema_ms_per_token": (
+                self._last_wave_time_ema[bucket] or 0.0
+            ),
             "gap_resolved": self._gap_resolved_count[bucket],
             "current_gap_ema_ms": self._layer_gap_ema[bucket] or 0.0,
         }
@@ -1345,12 +1388,14 @@ class ExpertCacheOffloader(BaseOffloader):
         logger.info(
             "[ExpertCacheOffloader] timing accuracy (pass=%d) decode: "
             "resolved=%d would_have_discarded=%d (rate=%.3f) "
-            "ema_ms_per_tok=%.4f gap_ema_ms=%.4f (gap_resolved=%d) | "
+            "ema_ms_per_tok=%.4f last_wave_ms_per_tok=%.4f "
+            "gap_ema_ms=%.4f (gap_resolved=%d) | "
             "transfer: startup_ms_per_expert=%.4f "
             "real_avg_ms_per_expert=%.4f effective_ms_per_expert=%.4f (n=%d)",
             self._pass_count,
             td["resolved"], td["would_have_discarded"],
             td["would_have_discarded_rate"], td["current_ema_ms_per_token"],
+            td["current_last_wave_ema_ms_per_token"],
             td["current_gap_ema_ms"], td["gap_resolved"],
             xfer["startup_ms_per_expert"], xfer["real_avg_ms_per_expert"],
             xfer["effective_ms_per_expert"], xfer["real_sample_experts"],
