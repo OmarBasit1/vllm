@@ -22,7 +22,8 @@ set -uo pipefail
 
 ENV_BIN=${ENV_BIN:-/home/obasit/miniconda3/envs/vllm-moe-expert-cache/bin}
 EXP=${EXP:-/export3/obasit/ClusterMoE/experiments/exp3_batch_sweep}
-DATASET=/export3/obasit/ClusterMoE/experiments/exp1_chunk_interference/dataset/wildchat_1k.jsonl
+DATASET=${DATASET:-/export3/obasit/ClusterMoE/experiments/exp1_chunk_interference/dataset/wildchat_1k.jsonl}
+DATASET_NAME=${DATASET_NAME:-custom}
 SCRIPTDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODEL=Qwen/Qwen3-Coder-30B-A3B-Instruct
 PORT=8000
@@ -77,9 +78,10 @@ PREFETCH="--offload-backend prefetch --offload-group-size 2 --offload-num-in-gro
 # rest ("misses") are loaded on demand, evicting the least-valuable resident
 # experts (graded LFU). The pool is sized for parity with the UVA arm's
 # --cpu-offload-gb 27: this model has 128 experts/layer at ~9.0 MiB/expert (bf16
-# w13+w2), so 3072 pooled experts ~= 3072*9.0 MiB ~= 27 GiB (plus a ~1.15 GiB
-# contiguous per-wave compute buffer). --expert-cache-budget-gb 27 fails fast if
-# the *measured* resident footprint drifts >15% from the UVA bar.
+# w13+w2), so 3072 pooled experts ~= 3072*9.0 MiB ~= 27 GiB (P7.4 structural:
+# no separate compute buffer any more -- `param.data` aliases the pool
+# directly). --expert-cache-budget-gb 27 fails fast if the *measured* resident
+# footprint drifts >15% from the UVA bar.
 #
 # --expert-cache-waves selects the per-layer schedule: 1 = stall (load all misses,
 # then one kernel over hits+misses); 2 = overlap (compute resident hits while the
@@ -88,10 +90,14 @@ PREFETCH="--offload-backend prefetch --offload-group-size 2 --offload-num-in-gro
 # prefetched within a measured PCIe budget (--expert-cache-predict-k /
 # --expert-cache-prefetch-horizon). --expert-cache-max-transient-experts is gone
 # (the old per-wave scratch no longer exists).
+# EXPERT_CACHE_EXTRA_ARGS (env-overridable, default empty): appended verbatim
+# so a one-off knob (e.g. P7.8's --expert-cache-eviction-policy-prefill) can be
+# swept without changing the fixed baseline args every other comparison uses.
 EXPERT_CACHE_COMMON="--offload-backend expert_cache --expert-cache-capacity 3072 \
-  --expert-cache-predict-k 16 --expert-cache-prefetch-horizon 1 \
+  --expert-cache-predict-k -1 --expert-cache-prefetch-horizon 1 \
   --expert-cache-budget-gb 27 --expert-cache-params w13_weight w2_weight \
-  --enforce-eager"
+  --expert-cache-predictor-artifacts /export3/obasit/ClusterMoE/qwen3_coder \
+  --enforce-eager ${EXPERT_CACHE_EXTRA_ARGS:-}"
 EXPERT_CACHE_W1="$EXPERT_CACHE_COMMON --expert-cache-waves 1"
 EXPERT_CACHE_W2="$EXPERT_CACHE_COMMON --expert-cache-waves 2"
 
@@ -146,11 +152,18 @@ run_bench() {  # $1=cfg $2=batch
   local cfg=$1 batch=$2 tag="b${batch}"
   bash "$SCRIPTDIR/monitor.sh" "$cfg" "$tag" "$EXP/monitor" "$PORT" &
   local mon_pid=$!
+  # timed_trace (e.g. mooncake) defaults to replaying its own embedded
+  # per-request timestamps (--self-timed), which would bypass the
+  # --max-concurrency/--request-rate knobs this batch-size sweep depends on
+  # to control concurrency. --no-self-timed is only valid for timed_trace
+  # (errors otherwise), so gate it on $DATASET_NAME.
+  local self_timed_flag=()
+  [ "$DATASET_NAME" = "timed_trace" ] && self_timed_flag=(--no-self-timed)
   $NUMACTL $ENV_BIN/vllm bench serve \
     --backend openai --host 127.0.0.1 --port $PORT --model $MODEL \
-    --dataset-name custom --dataset-path "$DATASET" \
+    --dataset-name "$DATASET_NAME" --dataset-path "$DATASET" \
     --custom-output-len -1 --num-prompts "$NPROMPTS" --seed 0 --disable-shuffle \
-    --ignore-eos --num-warmups 3 --burstiness 1.0 \
+    --ignore-eos --num-warmups 3 --burstiness 1.0 "${self_timed_flag[@]}" \
     --request-rate inf --max-concurrency "$batch" \
     --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,90,99 \
     --save-result --save-detailed --result-dir "$EXP/results" \

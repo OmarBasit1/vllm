@@ -20,6 +20,7 @@ import numpy as np
 import pytest
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from vllm.model_executor.offloader.expert_cache import (
     DummyFirstKPredictor,
@@ -699,8 +700,8 @@ def test_freq_is_global_and_survives_an_evict_reload_cycle():
 
 def test_memory_accounting_independent_of_routing():
     off, cache, mods = _wire(E=8, pool_experts=5)
-    # pool (5) + contiguous compute buffer (global_num_experts=8), each row 16 B.
-    assert cache.resident_bytes() == (5 + 8) * (4 * 2 * 2)
+    # P7.4 (structural): only the pool (5 slots) is GPU-resident, each row 16 B.
+    assert cache.resident_bytes() == 5 * (4 * 2 * 2)
     before = cache.resident_bytes()
     list(off.iter_expert_waves(mods[0], torch.tensor([[0, 1, 2, 3]], device=DEVICE)))
     assert cache.resident_bytes() == before  # pool size fixed regardless of load
@@ -976,10 +977,14 @@ def test_prefetch_skips_already_resident_and_loads_predicted():
     )
     # Force a positive budget.
     off._t_per_expert_ms = 0.001
-    off._layer_time_ema["prefill"] = 1.0
+    off._layer_time_ema["decode"] = 1.0
     # Predicted for layer.1 = {0,1,2}; make {0} already resident (promote-on-hit skip).
     cache.load([("layer.1", 0)], horizon=set())
-    list(off.iter_expert_waves(mods[0], torch.zeros(32, 2, dtype=torch.long, device=DEVICE)))
+    # Single-token (decode) step: P7.3 bypasses predict_k-based prediction
+    # entirely for "prefill" steps (see test_prefetch_loaded_bucketed_by_
+    # triggering_step for that behavior instead), and this test is
+    # specifically about predict_k-driven prediction + promote-on-hit skip.
+    list(off.iter_expert_waves(mods[0], torch.zeros(1, 2, dtype=torch.long, device=DEVICE)))
     assert cache.is_resident("layer.1", 1)
     assert cache.is_resident("layer.1", 2)
     assert off.prefetch_loaded == 2  # expert 0 was already resident, not re-loaded
@@ -1075,8 +1080,11 @@ def test_get_stats_bucket_hit_rate_and_prefetch_ratio():
 
 
 def test_prefetch_loaded_bucketed_by_triggering_step():
+    # pool_experts > E: P7.3 makes a "prefill" step prefetch *every* expert of
+    # the upcoming layer (not just `predict_k`), so the pool needs room for
+    # that full set (E) plus layer.0's own single resident expert.
     off, cache, mods = _wire(
-        num_layers=2, E=8, pool_experts=8, waves=1, predict_k=3, prefetch_horizon=1
+        num_layers=2, E=8, pool_experts=16, waves=1, predict_k=3, prefetch_horizon=1
     )
     off._t_per_expert_ms = 0.001
     off._layer_time_ema["prefill"] = 1.0
@@ -1108,8 +1116,11 @@ def test_predict_called_once_per_step_even_when_prefetch_fires():
     # Force a positive transfer budget so _issue_prefetch actually runs its
     # queue-building path (the second historical predict() call site).
     off._t_per_expert_ms = 0.001
-    off._layer_time_ema["prefill"] = 1.0
-    list(off.iter_expert_waves(mods[0], torch.zeros(32, 2, dtype=torch.long, device=DEVICE)))
+    off._layer_time_ema["decode"] = 1.0
+    # Single-token (decode) step: P7.3 bypasses the predictor entirely for
+    # "prefill" steps, which would make `calls` stay 0 -- this test is
+    # specifically about the predictor being queried at most once per step.
+    list(off.iter_expert_waves(mods[0], torch.zeros(1, 2, dtype=torch.long, device=DEVICE)))
     # prefetch_horizon=1 -> exactly one upcoming layer -> exactly one predict().
     assert off.predictor.calls == 1
 
@@ -1150,13 +1161,92 @@ class _MoEModule(nn.Module):
         )
 
 
+def _run_moe_production_path(
+    x, w1, w2, tw, ti, global_num_experts, expert_map, top_k
+):
+    """Replicates `TritonExperts.apply()`'s actual assignment path (the one
+    `ExpertCacheOffloader` is validated against via `_validate_kernel_support`)
+    -- `_prepare_expert_assignment(..., ignore_invalid_experts=False)`, the
+    default -- rather than going through the top-level `fused_experts()`
+    convenience wrapper, which hardcodes `ignore_invalid_experts=True`. That
+    flag controls two DIFFERENT low-level code paths for resolving
+    `expert_map`: `True` passes it straight into the `moe_align_block_size`
+    CUDA op, which (empirically verified) assumes a dense/small local index
+    range and silently produces garbage for arbitrary local indices (e.g. our
+    scattered pool slots); `False` (production's default) resolves it via a
+    plain `expert_ids = expert_map[expert_ids]` gather afterward, which is
+    correct for ANY local index. Using the wrong one here would validate a
+    kernel path this offloader never actually exercises."""
+    import triton.language as tl
+
+    from vllm.model_executor.layers.fused_moe.fused_moe import (
+        _get_config_dtype_str,
+        _prepare_expert_assignment,
+        dispatch_fused_moe_kernel,
+        try_get_optimal_moe_config,
+    )
+
+    num_tokens = x.shape[0]
+    N, K = w1.shape[1], w2.shape[1]
+    inter = N // 2
+    dtype = x.dtype
+    compute_type = {
+        torch.float16: tl.float16,
+        torch.bfloat16: tl.bfloat16,
+        torch.float32: tl.float32,
+    }[dtype]
+
+    config_dtype = _get_config_dtype_str(
+        use_fp8_w8a8=False, use_int8_w8a16=False, use_int4_w4a16=False, dtype=dtype
+    )
+    config = try_get_optimal_moe_config(
+        w1.size(), w2.size(), top_k, config_dtype, num_tokens, block_shape=None
+    )
+    sorted_token_ids, expert_ids, num_tokens_post_padded = _prepare_expert_assignment(
+        ti, config, num_tokens, top_k, global_num_experts, expert_map,
+        ignore_invalid_experts=False,
+    )
+
+    cache13 = torch.empty(
+        num_tokens * top_k * max(N, K), device=x.device, dtype=dtype
+    )
+    intermediate_cache1 = cache13[: num_tokens * top_k * N].view(num_tokens, top_k, N)
+    intermediate_cache3 = cache13[: num_tokens * top_k * K].view(num_tokens, top_k, K)
+    intermediate_cache2 = torch.empty(
+        (num_tokens * top_k, inter), device=x.device, dtype=dtype
+    )
+
+    dispatch_fused_moe_kernel(
+        x, w1, intermediate_cache1, None, None, None, tw,
+        sorted_token_ids, expert_ids, num_tokens_post_padded, False, top_k, config,
+        compute_type=compute_type, use_fp8_w8a8=False, use_int8_w8a8=False,
+        use_int8_w8a16=False, use_int4_w4a16=False, per_channel_quant=False,
+        block_shape=None, B_bias=None,
+    )
+    act_out = (
+        F.silu(intermediate_cache1[..., :inter]) * intermediate_cache1[..., inter:]
+    )
+    intermediate_cache2.copy_(act_out.reshape(-1, inter))
+
+    dispatch_fused_moe_kernel(
+        intermediate_cache2, w2, intermediate_cache3, None, None, None, tw,
+        sorted_token_ids, expert_ids, num_tokens_post_padded, True, 1, config,
+        compute_type=compute_type, use_fp8_w8a8=False, use_int8_w8a8=False,
+        use_int8_w8a16=False, use_int4_w4a16=False, per_channel_quant=False,
+        block_shape=None, B_bias=None,
+    )
+    return intermediate_cache3.sum(dim=1)
+
+
 @requires_cuda
 @pytest.mark.parametrize("waves", [1, 2])
 def test_pool_wave_sum_equals_full_residency(waves):
-    """Driving the real cache: experts sit at non-identity pool slots, each wave
-    gathers them into the dense compute buffer via ``publish``, and summing the
-    per-wave kernel outputs equals the single full-residency output — for both
-    wave modes."""
+    """Driving the real cache: experts sit at non-identity, scattered pool
+    slots; each wave's `publish()` points params at the pool directly and
+    resolves `_expert_map` to those slots (P7.4 structural -- no gather), and
+    summing the per-wave kernel outputs (via the production assignment path,
+    see `_run_moe_production_path`) equals the single full-residency output
+    -- for both wave modes."""
     from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
 
     torch.manual_seed(0)
@@ -1183,7 +1273,7 @@ def test_pool_wave_sum_equals_full_residency(waves):
         per_expert_bytes=(w1[0].numel() + w2[0].numel()) * 2,
     )
     # A decoy first layer occupies slots 0..E-1 so layer.0's experts land at
-    # non-identity slots E..2E-1 — exercising the gather's slot lookup.
+    # non-identity slots E..2E-1 — exercising the pool-slot indirection.
     decoy = _MoEModule("decoy", E, w1.shape[1:], w2.shape[1:])
     cache.register_layer(
         "decoy",
@@ -1206,14 +1296,285 @@ def test_pool_wave_sum_equals_full_residency(waves):
     for group in wave_groups:
         cache.publish("layer.0", group)
         torch.cuda.synchronize()
-        summed += fused_experts(
+        summed += _run_moe_production_path(
             x,
             module.w13_weight.data,
             module.w2_weight.data,
             tw,
             ti,
-            global_num_experts=E,
-            expert_map=module._expert_map,
+            E,
+            module._expert_map,
+            top_k,
         ).float()
 
     torch.testing.assert_close(summed, reference, atol=2e-2, rtol=2e-2)
+
+
+# ---------------------------------------------------------------------------
+# Phase 7: P7.3 (prefill stream-ahead), P7.5 (fixed+marginal transfer fit)
+# ---------------------------------------------------------------------------
+
+
+def test_prefill_bypasses_predictor_and_uses_full_expert_range():
+    """P7.3: a "prefill"-bucketed step must not call the predictor at all
+    (prediction is worthless when a chunk touches ~every expert anyway, and
+    the MLP forward is pure waste on a large token count) and must instead
+    treat every expert of the upcoming layer as a horizon/prefetch
+    candidate."""
+
+    class _CountingPredictor(ExpertPredictor):
+        def __init__(self):
+            self.calls = 0
+
+        def predict(self, layer_idx: int, k: int) -> list[int]:
+            self.calls += 1
+            return list(range(k))
+
+    off, cache, mods = _wire(
+        num_layers=2, E=4, pool_experts=8, waves=1, predict_k=1, prefetch_horizon=1
+    )
+    off.predictor = _CountingPredictor()
+    off._t_per_expert_ms = 0.001
+    off._layer_time_ema["prefill"] = 1.0
+    # 32 tokens with no forward context -> bucketed "prefill".
+    topk_ids = torch.zeros(32, 2, dtype=torch.long, device=DEVICE)
+    list(off.iter_expert_waves(mods[0], topk_ids))
+    assert off.predictor.calls == 0, "predictor must be bypassed during prefill"
+    # All E=4 experts of layer.1 (not just predict_k=1) must be horizon/
+    # prefetch candidates -- verified indirectly via residency after a
+    # prefetch-permitting budget.
+    for g in range(4):
+        assert cache.is_resident("layer.1", g), f"expert {g} should be prefetched"
+
+
+def test_prefill_full_range_respects_predict_k_zero_disable():
+    """`predict_k=0` (prediction explicitly disabled) must still mean "predict
+    nothing" during prefill, not "use the full range" -- P7.3's bypass is
+    gated on this. The predictor is still queried (with `k=0`, same as any
+    other disabled-prediction step) rather than skipped outright -- disabling
+    prediction means an empty *result*, not a special no-call path."""
+
+    class _CountingPredictor(ExpertPredictor):
+        def __init__(self):
+            self.calls = 0
+
+        def predict(self, layer_idx: int, k: int) -> list[int]:
+            self.calls += 1
+            return list(range(k))
+
+    off, cache, mods = _wire(
+        num_layers=2, E=4, pool_experts=8, waves=1, predict_k=0, prefetch_horizon=1
+    )
+    off.predictor = _CountingPredictor()
+    predicted = off._predict_upcoming(cur_idx=0, k=0, bucket="prefill")
+    assert predicted == []
+    assert off.predictor.calls == 1
+
+
+def test_transfer_regression_fits_fixed_plus_marginal():
+    """P7.5: fitting `elapsed = fixed + marginal * n` over varying-size
+    samples should recover a marginal rate close to the true per-expert cost
+    when a fixed per-batch overhead is present, whereas plain `elapsed / n`
+    (on a small batch) would overestimate it."""
+    off, cache, _ = _wire()
+    true_fixed, true_marginal = 0.2, 0.05
+    # Deterministic samples at a few different batch sizes; every sample sees
+    # a fixed cost plus a per-expert marginal cost.
+    for n in [1, 2, 3, 4, 5, 6, 7, 8] * 4:
+        elapsed = true_fixed + true_marginal * n
+        cache._update_transfer_regression(n, elapsed)
+    assert cache._transfer_marginal_ms_ema is not None
+    assert cache._transfer_marginal_ms_ema == pytest.approx(true_marginal, rel=0.05)
+    assert cache._transfer_fixed_ms_ema == pytest.approx(true_fixed, rel=0.05)
+    # Plain elapsed/n on a small batch overestimates the marginal rate --
+    # confirms the fit is actually doing something different (and better).
+    naive_small_batch = (true_fixed + true_marginal * 2) / 2
+    assert naive_small_batch > cache._transfer_marginal_ms_ema
+
+
+def test_transfer_regression_ignored_until_enough_samples():
+    """Before enough (varied) samples have been seen, the fit must not
+    produce a value -- `_effective_t_per_expert_ms` should keep falling back
+    to `real_ms_per_expert_ema`/the startup calibration rather than act on a
+    noisy/ill-conditioned regression."""
+    off, cache, _ = _wire()
+    assert cache._transfer_marginal_ms_ema is None
+    cache._update_transfer_regression(3, 1.0)
+    assert cache._transfer_marginal_ms_ema is None  # only one sample so far
+
+
+def test_effective_transfer_rate_prefers_fitted_marginal_once_available():
+    """Once the P7.5 regression has a value, it must take priority over the
+    plain `real_ms_per_expert_ema` in `_effective_t_per_expert_ms`."""
+    off, cache, _ = _wire()
+    cache.real_ms_per_expert_ema = 0.9
+    cache._transfer_marginal_ms_ema = 0.4
+    assert off._effective_t_per_expert_ms() == 0.4
+
+
+# ---------------------------------------------------------------------------
+# Phase 7 (round 2): P7.5 fix (variance gate), P7.8 (per-bucket eviction),
+# P7.4 structural (direct pool publish), P7.12 (persistent _expert_map buffer)
+# ---------------------------------------------------------------------------
+
+
+def test_transfer_regression_rejects_low_variance_window():
+    """P7.5 fix: a window where `n` barely varies (here 5/6, coefficient of
+    variation ~0.09, well under `_XFER_MIN_CV=0.15`) must never be trusted,
+    even with many samples and a technically nonzero `denom` -- this is
+    exactly the "merely noisy, not exactly degenerate" case the original
+    `abs(denom) < 1e-6` guard didn't catch (measured in production: fitted
+    marginal swinging 2x+ between consecutive samples of the same run)."""
+    off, cache, _ = _wire()
+    for n in [5, 6] * 30:
+        cache._update_transfer_regression(n, 0.2 + 0.05 * n)
+    assert cache._transfer_marginal_ms_ema is None
+
+
+def test_transfer_regression_requires_dedicated_min_effective_samples():
+    """The slower, dedicated regression decay (`_XFER_REGRESSION_ALPHA`) means
+    the fit must not fire off just 2 effective samples (the old threshold) --
+    it needs `_XFER_MIN_EFFECTIVE_SAMPLES` of the SLOWER-decaying weight."""
+    off, cache, _ = _wire()
+    cache._update_transfer_regression(2, 0.3)
+    cache._update_transfer_regression(8, 0.6)
+    assert cache._xfer_ew_w < cache._XFER_MIN_EFFECTIVE_SAMPLES
+    assert cache._transfer_marginal_ms_ema is None
+
+
+def test_eviction_prefill_defaults_to_none_reuses_main_policy():
+    """`eviction_prefill=None` (the default) must resolve to the same policy
+    object for both buckets -- no behavior change for existing configs that
+    don't opt into P7.8."""
+    cache = _GlobalExpertCache(
+        param_names=["w13_weight"],
+        pool_experts=4,
+        global_num_experts=4,
+        device=DEVICE,
+        eviction=LRUEviction(),
+        per_expert_bytes=16,
+    )
+    assert cache._eviction_for("decode") is cache.eviction
+    assert cache._eviction_for("prefill") is cache.eviction
+
+
+def test_bucket_selects_distinct_eviction_policy():
+    """P7.8: with an explicit `eviction_prefill`, a "prefill"-bucketed
+    `_pick_victims` call must use it instead of the default `eviction`, and a
+    "decode"-bucketed call must still use the default -- LRU and MRU pick
+    opposite victims from the same recency state, so this is directly
+    observable."""
+    off, cache, _ = _wire(E=8, pool_experts=4)
+    cache.eviction = LRUEviction()
+    cache.eviction_prefill = MRUEviction()
+    keys = [("layer.0", 0), ("layer.0", 1), ("layer.1", 2), ("layer.1", 3)]
+    cache.load(keys, horizon=set())
+    # `load()` itself doesn't bump recency -- establish it explicitly,
+    # oldest -> newest: 0, 1, 2, 3.
+    for layer, gid in keys:
+        cache.bump(layer, [gid])
+    decode_victims = cache._pick_victims(1, set(), cur_layer_idx=0, bucket="decode")
+    prefill_victims = cache._pick_victims(
+        1, set(), cur_layer_idx=0, bucket="prefill"
+    )
+    assert decode_victims == [("layer.0", 0)]  # LRU: oldest first
+    assert prefill_victims == [("layer.1", 3)]  # MRU: newest first
+
+
+def test_load_bucket_argument_reaches_eviction_policy():
+    """`load(..., bucket=...)` must thread through to `_pick_victims` -- not
+    just `_pick_victims` called directly, since that's what
+    `iter_expert_waves`/`_issue_prefetch` actually call."""
+    off, cache, _ = _wire(E=8, pool_experts=4)
+    cache.eviction = LRUEviction()
+    cache.eviction_prefill = MRUEviction()
+    keys = [("layer.0", 0), ("layer.0", 1), ("layer.1", 2), ("layer.1", 3)]
+    cache.load(keys, horizon=set())
+    for layer, gid in keys:
+        cache.bump(layer, [gid])
+    cache.load([("layer.0", 4)], horizon=set(), bucket="prefill")
+    # MRU (prefill) should have evicted the newest (("layer.1", 3)), not the
+    # oldest (("layer.0", 0), which LRU/decode would have picked).
+    assert not cache.is_resident("layer.1", 3)
+    assert cache.is_resident("layer.0", 0)
+
+
+def test_offloader_builds_eviction_prefill_from_config():
+    """`ExpertCacheOffloader` must build a distinct `eviction_prefill` object
+    only when `eviction_policy_prefill` is explicitly set, honoring a
+    distance-weight override when given and falling back to the main
+    `eviction_distance_weight` otherwise."""
+    off_default = ExpertCacheOffloader(pool_experts=4)
+    assert off_default.eviction_prefill is None
+
+    off_explicit = ExpertCacheOffloader(
+        pool_experts=4,
+        eviction_policy="lru",
+        eviction_policy_prefill="mru",
+    )
+    assert isinstance(off_explicit.eviction_prefill, MRUEviction)
+
+    off_weighted = ExpertCacheOffloader(
+        pool_experts=4,
+        eviction_policy="lru",
+        eviction_distance_weight=0.2,
+        eviction_policy_prefill="lru",
+        eviction_distance_weight_prefill=0.7,
+    )
+    assert off_weighted.eviction.distance_weight == 0.2
+    assert off_weighted.eviction_prefill.distance_weight == 0.7
+
+    off_inherited = ExpertCacheOffloader(
+        pool_experts=4,
+        eviction_policy="lru",
+        eviction_distance_weight=0.3,
+        eviction_policy_prefill="lru",
+    )
+    assert off_inherited.eviction_prefill.distance_weight == 0.3
+
+
+def test_publish_local_num_experts_is_pool_size_not_wave_size():
+    """P7.4 (structural): `local_num_experts` must be the constant pool size,
+    not the (varying, small) number of experts this wave actually needs --
+    the kernel indexes via `_expert_map`, not a dense wave-sized range."""
+    off, cache, mods = _wire(E=4, pool_experts=8)
+    cache.load([("layer.0", g) for g in range(4)], horizon=set())
+    cache.publish("layer.0", [0, 1])
+    assert mods[0].local_num_experts == 8
+
+
+def test_publish_points_param_directly_at_pool_no_gather():
+    """P7.4 (structural): `param.data` must alias the shared pool tensor
+    itself (same storage), not a separate gathered/copied buffer."""
+    off, cache, mods = _wire(E=4, pool_experts=8)
+    cache.load([("layer.0", g) for g in range(4)], horizon=set())
+    cache.publish("layer.0", [0, 1])
+    assert mods[0].w13_weight.data.data_ptr() == cache.pool["w13_weight"].data_ptr()
+    assert mods[0].w13_weight.data.shape[0] == cache.pool_experts
+
+
+def test_expert_map_buffer_reused_across_publishes():
+    """P7.12: the `_expert_map` buffer object must be the SAME tensor across
+    repeated `publish()` calls for a layer (refilled in place), not freshly
+    allocated and re-registered every call."""
+    off, cache, mods = _wire(E=4, pool_experts=8)
+    cache.load([("layer.0", g) for g in range(4)], horizon=set())
+    cache.publish("layer.0", [0, 1])
+    first = mods[0]._expert_map
+    cache.publish("layer.0", [2, 3])
+    second = mods[0]._expert_map
+    assert first is second
+    assert first is cache._expert_map_buf["layer.0"]
+
+
+def test_expert_map_buffer_correctly_refilled_between_publishes():
+    """The in-place refill (P7.12) must not leak a stale mapping from a
+    previous `publish()` call -- an expert resident this wave but NOT in the
+    new `gids` must read back as -1 (non-resident), not its old slot."""
+    off, cache, mods = _wire(E=4, pool_experts=8)
+    cache.load([("layer.0", g) for g in range(4)], horizon=set())
+    cache.publish("layer.0", [0, 1])
+    assert mods[0]._expert_map[0].item() != -1
+    cache.publish("layer.0", [2, 3])
+    assert mods[0]._expert_map[0].item() == -1
+    assert mods[0]._expert_map[2].item() != -1

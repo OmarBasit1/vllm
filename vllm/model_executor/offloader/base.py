@@ -212,6 +212,10 @@ def create_offloader(offload_config: "OffloadConfig") -> BaseOffloader:
             budget_safety=expert_cache.budget_safety,
             eviction_distance_weight=expert_cache.eviction_distance_weight,
             eviction_freq_decay=expert_cache.eviction_freq_decay,
+            eviction_policy_prefill=expert_cache.eviction_policy_prefill,
+            eviction_distance_weight_prefill=(
+                expert_cache.eviction_distance_weight_prefill
+            ),
             offload_params=expert_cache.offload_params,
         )
     else:

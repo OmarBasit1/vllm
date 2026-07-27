@@ -490,6 +490,17 @@ class _GlobalExpertCache:
 
     _EMA_ALPHA = 0.3  # matches ExpertCacheOffloader._EMA_ALPHA (compute-time side)
     _DECAY_INTERVAL = 1000  # bump() calls between freq_decay applications
+    # P7.5: dedicated (slower) decay for the fixed+marginal transfer-cost
+    # regression -- ~20 effective samples of memory vs `_EMA_ALPHA`'s ~3.3,
+    # since a 2-parameter fit needs more history to be statistically stable
+    # than a plain running average does. See `_update_transfer_regression`.
+    _XFER_REGRESSION_ALPHA = 0.05
+    # Minimum effective sample weight and minimum coefficient of variation
+    # (std/mean) of `n` required before trusting the fit -- rejects windows
+    # that are merely non-degenerate (`denom` technically nonzero) but too
+    # narrow a spread of batch sizes to pin down a slope reliably.
+    _XFER_MIN_EFFECTIVE_SAMPLES = 5.0
+    _XFER_MIN_CV = 0.15
 
     def __init__(
         self,
@@ -500,12 +511,18 @@ class _GlobalExpertCache:
         eviction: EvictionPolicy,
         per_expert_bytes: int,
         freq_decay: float = 1.0,
+        eviction_prefill: EvictionPolicy | None = None,
     ):
         self.param_names = param_names
         self.pool_experts = pool_experts
         self.global_num_experts = global_num_experts
         self.device = device
         self.eviction = eviction
+        # P7.8: optional separate eviction policy for `bucket == "prefill"`
+        # steps; `None` (default) reuses `eviction` for both buckets, so
+        # existing configs/behavior are unchanged unless explicitly opted in.
+        # See `_eviction_for`.
+        self.eviction_prefill = eviction_prefill
         self.per_expert_bytes = per_expert_bytes
         self.freq_decay = freq_decay
         self._cuda = device.type == "cuda"
@@ -515,14 +532,35 @@ class _GlobalExpertCache:
         # Per-layer routed_experts module (for publishing the expert map).
         self.layer_module: dict[str, nn.Module] = {}
         # The shared GPU pool, one tensor per param, allocated in build_pool.
+        # `publish()` (P7.4 structural) points `param.data` at this tensor
+        # directly and resolves `_expert_map` to pool slots -- no separate
+        # per-wave compute buffer or gather.
         self.pool: dict[str, torch.Tensor] = {}
-        # Contiguous per-wave compute buffer (dense rows the kernel sees).
-        self.compute_buf: dict[str, torch.Tensor] = {}
+        # P7.12: one persistent `_expert_map` buffer per layer, allocated
+        # once in `build_pool` and registered once; `publish()` refills it
+        # in place (`fill_(-1)` + scatter) instead of allocating a fresh
+        # tensor and re-registering a buffer every call. Safe because every
+        # write and every kernel read of a given layer's map is issued on the
+        # same (main) CUDA stream in program order -- the same invariant that
+        # already lets `publish()` skip the P7.4 gather -- so a refill can
+        # never race a still-in-flight read of the map it's replacing. Not
+        # proven safe under a LoRA aux-stream schedule (`apply_w13_lora` also
+        # reads `expert_map`, potentially on a separate stream joined back to
+        # main later than this refill); this offloader isn't exercised with
+        # LoRA today, but that combination should be re-verified before
+        # relying on it in production.
+        self._expert_map_buf: dict[str, torch.Tensor] = {}
         # layer_name -> ordinal, for the eviction distance term (`_layer_staleness`).
         self._layer_idx_of: dict[str, int] = {}
 
         self.slot_to_key: list[Key | None] = [None] * pool_experts
         self.key_to_slot: dict[Key, int] = {}
+        # Incrementally maintained partition of slot indices (P7.7): avoids an
+        # O(pool_experts) Python scan of `slot_to_key` on every `_free_slots()`/
+        # `_pick_victims()` call. Updated at the two places occupancy actually
+        # changes: `_copy_into` (occupy) and `load()`'s eviction loop (free).
+        self._free_slots_set: set[int] = set(range(pool_experts))
+        self._occupied_slots: set[int] = set()
         # Global (all-layer, hit+miss) usage stats feeding eviction ranking --
         # NOT residency-scoped, and never reset/deleted on eviction, so LFU/LRU
         # answer "globally hot/recent" even for currently-non-resident experts.
@@ -534,6 +572,9 @@ class _GlobalExpertCache:
         # the ONLY eviction restriction; no separate "always-on" protection tier.
 
         self._copy_stream: torch.cuda.Stream | None = None
+        # P7.12: lazily-created, reused across every `load()` call -- see
+        # the reuse-safety comment at its use site in `load()`.
+        self._fork_event: torch.cuda.Event | None = None
 
         # Real (live-measured) transfer-time tracking, replacing reliance on
         # the once-at-startup PCIe calibration (`_t_per_expert_ms`) -- see
@@ -553,6 +594,42 @@ class _GlobalExpertCache:
         self.real_transfer_expert_count = 0
         self.real_ms_per_expert_ema: float | None = None
 
+        # P7.5: exponentially-weighted least-squares fit of
+        # `elapsed = fixed + marginal * n`, updated alongside
+        # `real_ms_per_expert_ema` in `drain_transfer_timing`. Plain
+        # `elapsed / n` (what `real_ms_per_expert_ema` computes) folds fixed
+        # per-batch launch/sync overhead into what's treated as a purely
+        # marginal per-expert cost -- measured systematically too high on the
+        # small (~2-4 expert) batches this cache usually transfers, which
+        # under-sizes `_transfer_budget` and keeps batches small: a
+        # self-reinforcing pessimism loop. `_transfer_marginal_ms_ema` (the
+        # fitted slope) is what `_effective_t_per_expert_ms` should use
+        # instead once the fit has enough samples to be well-conditioned;
+        # `_transfer_fixed_ms_ema` (the intercept) is diagnostic-only.
+        #
+        # P7.5 fix: the first shipped version decayed these sums at the same
+        # rate as this class's other EMAs (`_EMA_ALPHA=0.3` -> ~3.3 effective
+        # samples of memory), which is far too short a window for a 2-parameter
+        # fit -- measured in production oscillating >2x between consecutive
+        # log samples of the SAME run (e.g. 0.44/0.62/0.83/0.35 ms/expert on
+        # one ShareGPT batch=2 run) while the plain average stayed flat, and
+        # the only existing guard (`abs(denom) < 1e-6`) only rejects an
+        # EXACTLY-degenerate window, not a merely noisy/ill-conditioned one.
+        # Fixed two ways: (1) a slower, dedicated decay
+        # (`_XFER_REGRESSION_ALPHA`, ~20 effective samples) so the fit
+        # averages over enough transfers to be stable, and (2) an explicit
+        # relative-variance gate on `n` (see `_update_transfer_regression`)
+        # so a window where recent batch sizes happen to be nearly identical
+        # -- technically non-degenerate but still a poor basis for a 2-param
+        # fit -- is rejected rather than trusted.
+        self._xfer_ew_n = 0.0
+        self._xfer_ew_e = 0.0
+        self._xfer_ew_n2 = 0.0
+        self._xfer_ew_ne = 0.0
+        self._xfer_ew_w = 0.0
+        self._transfer_marginal_ms_ema: float | None = None
+        self._transfer_fixed_ms_ema: float | None = None
+
     # -- setup -------------------------------------------------------------
     def register_layer(
         self,
@@ -566,14 +643,13 @@ class _GlobalExpertCache:
         self._layer_idx_of[layer_name] = layer_idx
 
     def build_pool(self) -> None:
-        """Allocate the shared pool (scattered cache residency) and the contiguous
-        per-wave compute buffer (dense rows the kernel actually reads).
-
-        The kernel's ``expert_map`` path only supports *dense* local expert ids,
-        so a wave gathers its experts from their scattered pool slots into
-        ``compute_buf`` rows ``0..k-1`` and maps global id -> that dense row.
-        ``compute_buf`` is sized to a full layer (only one wave runs at a time),
-        reused across all layers and waves."""
+        """Allocate the shared pool (scattered cache residency), one tensor
+        per param. `publish()` (P7.4 structural) points every layer's
+        `param.data` at this same pool tensor directly -- no per-wave gather
+        or separate compute buffer; only the wave's `_expert_map` (global id
+        -> pool slot, or -1) changes. Each layer's `_expert_map` buffer (P7.12)
+        is also allocated and registered once here; `publish()` refills it in
+        place rather than allocating a fresh tensor per call."""
         example = next(iter(self.layer_cpu.values()))
         for name in self.param_names:
             shape = tuple(example[name].shape[1:])
@@ -582,18 +658,20 @@ class _GlobalExpertCache:
                 dtype=example[name].dtype,
                 device=self.device,
             )
-            self.compute_buf[name] = torch.empty(
-                (self.global_num_experts,) + shape,
-                dtype=example[name].dtype,
-                device=self.device,
-            )
         if self._cuda:
             self._copy_stream = torch.cuda.Stream(device=self.device)
-        for module in self.layer_module.values():
-            # Leave params pointing at a valid (empty) GPU view until first publish.
+        for layer_name, module in self.layer_module.items():
+            # Leave params pointing at a valid (empty) GPU view and no
+            # resident experts until the first `publish()` call for that
+            # layer.
             for name in self.param_names:
-                getattr(module, name).data = self.compute_buf[name][:0]
+                getattr(module, name).data = self.pool[name][:0]
             module.local_num_experts = 0
+            expert_map = torch.full(
+                (self.global_num_experts,), -1, dtype=torch.int32, device=self.device
+            )
+            self._expert_map_buf[layer_name] = expert_map
+            module.register_buffer("_expert_map", expert_map)
 
     # -- residency ---------------------------------------------------------
     def is_resident(self, layer: str, gid: int) -> bool:
@@ -622,26 +700,51 @@ class _GlobalExpertCache:
     def _evictable_keys(self) -> list[Key]:
         return [
             self.slot_to_key[s]  # type: ignore[misc]
-            for s in range(self.pool_experts)
-            if self.slot_to_key[s] is not None
-            and self.slot_to_key[s] not in self._step_pinned
+            for s in self._occupied_slots
+            if self.slot_to_key[s] not in self._step_pinned
         ]
 
+    def _eviction_for(self, bucket: str) -> EvictionPolicy:
+        """Resolve the `EvictionPolicy` for `bucket` (P7.8): `eviction_prefill`
+        when set and `bucket == "prefill"`, else the default `eviction`."""
+        if bucket == "prefill" and self.eviction_prefill is not None:
+            return self.eviction_prefill
+        return self.eviction
+
     def _pick_victims(
-        self, count: int, horizon: set[Key], cur_layer_idx: int
+        self, count: int, horizon: set[Key], cur_layer_idx: int, bucket: str = "decode"
     ) -> list[Key]:
         """Return up to ``count`` resident keys to evict, most-evictable first."""
-        evictable = self._evictable_keys()
+        if count <= 0:
+            return []
         ctx = EvictionContext(
             cur_layer_idx=cur_layer_idx,
             num_layers=max(1, len(self._layer_idx_of)),
             tick=max(1, self._tick),
             max_freq=max(1, self._max_freq),
         )
+        ev = self._eviction_for(bucket)
+        fast = self._pick_victims_fast(count, horizon, ctx, ev)
+        if fast is not None:
+            return fast
+        return self._pick_victims_slow(count, horizon, ctx, ev)
+
+    def _pick_victims_slow(
+        self,
+        count: int,
+        horizon: set[Key],
+        ctx: "EvictionContext",
+        ev: EvictionPolicy,
+    ) -> list[Key]:
+        """Reference path: per-candidate `EvictionPolicy.rank()` via
+        `heapq.nsmallest`. Kept as the ground truth for any `EvictionPolicy`
+        the vectorized fast path below doesn't recognize (only the three
+        registered types are vectorized)."""
+        evictable = self._evictable_keys()
         return heapq.nsmallest(
             count,
             evictable,
-            key=lambda k: self.eviction.rank(
+            key=lambda k: ev.rank(
                 k,
                 self.freq.get(k, 0),
                 self.last_used.get(k, 0),
@@ -651,11 +754,102 @@ class _GlobalExpertCache:
             ),
         )
 
+    def _pick_victims_fast(
+        self,
+        count: int,
+        horizon: set[Key],
+        ctx: "EvictionContext",
+        ev: EvictionPolicy,
+    ) -> list[Key] | None:
+        """Vectorized victim selection (P7.7) for the three shipped policies,
+        replacing a per-candidate Python `rank()` virtual-dispatch (plus
+        `heapq.nsmallest` bookkeeping) with a single gather into numpy arrays
+        followed by vectorized arithmetic and `np.argpartition`.
+
+        `freq`/`last_used` are read fresh from the canonical dicts every call
+        rather than cached per-slot: either dict can be mutated directly (not
+        only via `bump()` -- e.g. tests do this deliberately), so caching
+        would risk silently ranking on stale values. The gather loop itself
+        (O(occupied slots)) is unavoidable for that reason, but it replaces
+        the far more expensive part: a virtual `rank()` call plus tuple
+        construction per candidate. Returns `None` (caller falls back to
+        `_pick_victims_slow`) for any `EvictionPolicy` not one of the three
+        registered types.
+        """
+        is_lfu = isinstance(ev, LFUEviction)
+        is_lru = isinstance(ev, LRUEviction)
+        is_mru = isinstance(ev, MRUEviction)
+        if not (is_lfu or is_lru or is_mru):
+            return None
+
+        keys = [
+            self.slot_to_key[s]  # type: ignore[misc]
+            for s in self._occupied_slots
+            if self.slot_to_key[s] not in self._step_pinned
+        ]
+        n = len(keys)
+        if n == 0:
+            return []
+
+        last_used_arr = np.fromiter(
+            (self.last_used.get(k, 0) for k in keys), dtype=np.float64, count=n
+        )
+        in_horizon_arr = np.fromiter(
+            (k in horizon for k in keys), dtype=bool, count=n
+        )
+
+        if is_mru:
+            keep = 1.0 - last_used_arr / ctx.tick
+        else:
+            if is_lfu:
+                freq_arr = np.fromiter(
+                    (self.freq.get(k, 0) for k in keys), dtype=np.float64, count=n
+                )
+                base = freq_arr / ctx.max_freq
+            else:
+                base = last_used_arr / ctx.tick
+            w = ev.distance_weight
+            if w == 0.0:
+                keep = base
+            else:
+                layer_idx_arr = np.fromiter(
+                    (self._layer_idx_of[k[0]] for k in keys), dtype=np.int64, count=n
+                )
+                staleness = (
+                    (layer_idx_arr - ctx.cur_layer_idx) % ctx.num_layers
+                ) / max(1, ctx.num_layers - 1)
+                keep = (1 - w) * base + w * (1 - staleness)
+
+        non_horizon_idx = np.flatnonzero(~in_horizon_arr)
+        horizon_idx = np.flatnonzero(in_horizon_arr)
+        picks = self._smallest_indices(non_horizon_idx, keep, count)
+        if len(picks) < count:
+            picks += self._smallest_indices(horizon_idx, keep, count - len(picks))
+        return [keys[i] for i in picks]
+
+    @staticmethod
+    def _smallest_indices(idx: np.ndarray, keep: np.ndarray, count: int) -> list[int]:
+        """Indices (into `keep`) of the `count` smallest values among `idx`,
+        ascending. Uses `argpartition` (O(n)) instead of a full sort when a
+        strict subset is requested."""
+        if idx.size == 0 or count <= 0:
+            return []
+        if count >= idx.size:
+            ordered = idx[np.argsort(keep[idx], kind="stable")]
+        else:
+            top = idx[np.argpartition(keep[idx], count - 1)[:count]]
+            ordered = top[np.argsort(keep[top], kind="stable")]
+        return ordered.tolist()
+
     def _free_slots(self) -> list[int]:
-        return [s for s in range(self.pool_experts) if self.slot_to_key[s] is None]
+        return list(self._free_slots_set)
 
     def load(
-        self, keys: list[Key], horizon: set[Key], cur_layer_idx: int = 0
+        self,
+        keys: list[Key],
+        horizon: set[Key],
+        cur_layer_idx: int = 0,
+        bucket: str = "decode",
     ) -> "torch.cuda.Event | None":
         """Make ``keys`` resident, evicting as needed, and return a completion
         event (None on CPU / when nothing to load).
@@ -664,7 +858,8 @@ class _GlobalExpertCache:
         — so a load can never evict an expert the current step needs; every
         other resident expert is a fair eviction candidate. The fork-event
         discipline keeps a copy from overwriting a slot a prior wave's compute
-        is still reading.
+        is still reading. ``bucket`` selects the eviction policy (P7.8; see
+        ``_eviction_for``).
         """
         to_load = [k for k in keys if k not in self.key_to_slot]
         if not to_load:
@@ -673,7 +868,7 @@ class _GlobalExpertCache:
         free = self._free_slots()
         need_evict = max(0, len(to_load) - len(free))
         victims = (
-            self._pick_victims(need_evict, horizon, cur_layer_idx)
+            self._pick_victims(need_evict, horizon, cur_layer_idx, bucket)
             if need_evict
             else []
         )
@@ -688,10 +883,21 @@ class _GlobalExpertCache:
         for vkey in victims:
             vslot = self.key_to_slot.pop(vkey)
             self.slot_to_key[vslot] = None
+            self._occupied_slots.discard(vslot)
+            self._free_slots_set.add(vslot)
             free.append(vslot)
 
         if self._cuda:
-            fork = torch.cuda.Event()
+            # P7.12: reuse one persistent non-timing Event instead of
+            # allocating a fresh one per `load()` call -- safe because it is
+            # recorded and immediately consumed (via `wait_event`, which only
+            # needs the event's *next* recorded point, not its prior one)
+            # within this same call; nothing holds a reference to it across
+            # calls the way `_transfer_timing_pending` does for the timing
+            # events below.
+            if self._fork_event is None:
+                self._fork_event = torch.cuda.Event()
+            fork = self._fork_event
             torch.cuda.current_stream().record_event(fork)
             self._copy_stream.wait_event(fork)
             xfer_start = torch.cuda.Event(enable_timing=True)
@@ -730,6 +936,44 @@ class _GlobalExpertCache:
                 if prev is None
                 else (1 - self._EMA_ALPHA) * prev + self._EMA_ALPHA * ms_per_expert
             )
+            self._update_transfer_regression(n, elapsed)
+
+    def _update_transfer_regression(self, n: int, elapsed_ms: float) -> None:
+        """Exponentially-weighted least-squares fit of
+        `elapsed = fixed + marginal * n` (P7.5). See the field docstring in
+        `__init__` for why this is needed, and for why the decay/gating below
+        (P7.5 fix) is stricter than the first shipped version."""
+        decay = 1 - self._XFER_REGRESSION_ALPHA
+        self._xfer_ew_n = decay * self._xfer_ew_n + n
+        self._xfer_ew_e = decay * self._xfer_ew_e + elapsed_ms
+        self._xfer_ew_n2 = decay * self._xfer_ew_n2 + n * n
+        self._xfer_ew_ne = decay * self._xfer_ew_ne + n * elapsed_ms
+        self._xfer_ew_w = decay * self._xfer_ew_w + 1.0
+
+        if self._xfer_ew_w < self._XFER_MIN_EFFECTIVE_SAMPLES:
+            return
+        mean_n = self._xfer_ew_n / self._xfer_ew_w
+        if mean_n <= 0:
+            return
+        var_n = max(0.0, self._xfer_ew_n2 / self._xfer_ew_w - mean_n * mean_n)
+        # Coefficient of variation of `n`: rejects windows where recent batch
+        # sizes are too similar to pin down a 2-parameter fit reliably, even
+        # though the raw `denom` below is technically nonzero.
+        if var_n**0.5 / mean_n < self._XFER_MIN_CV:
+            return
+        denom = self._xfer_ew_w * self._xfer_ew_n2 - self._xfer_ew_n * self._xfer_ew_n
+        if abs(denom) < 1e-6:
+            return
+        slope = (
+            self._xfer_ew_w * self._xfer_ew_ne - self._xfer_ew_n * self._xfer_ew_e
+        ) / denom
+        intercept = (self._xfer_ew_e - slope * self._xfer_ew_n) / self._xfer_ew_w
+        # Marginal cost per expert cannot be negative; a noisy/unstable fit
+        # falls back to `real_ms_per_expert_ema` rather than propagate a
+        # nonsensical (or negative) budget input.
+        if slope > 0:
+            self._transfer_marginal_ms_ema = slope
+            self._transfer_fixed_ms_ema = max(0.0, intercept)
 
     def _copy_into(self, keys: list[Key], free: list[int]) -> None:
         for (layer, gid), slot in zip(keys, free):
@@ -739,32 +983,59 @@ class _GlobalExpertCache:
                 )
             self.slot_to_key[slot] = (layer, gid)
             self.key_to_slot[(layer, gid)] = slot
+            self._free_slots_set.discard(slot)
+            self._occupied_slots.add(slot)
 
     def publish(self, layer: str, gids: list[int]) -> None:
-        """Gather ``gids`` from their scattered pool slots into contiguous
-        ``compute_buf`` rows, point the module's params at that dense view, and
-        register an ``_expert_map`` resolving global id -> its dense row (all
-        other experts -> -1, contributing exactly zero)."""
+        """Point the module's params at the shared pool directly and register
+        an ``_expert_map`` resolving each of ``gids`` to its pool slot (every
+        other global id -> -1, contributing exactly zero).
+
+        P7.4 (structural): no per-wave gather. Earlier revisions copied
+        ``gids`` out of their scattered pool slots into a dense per-layer
+        ``compute_buf`` and mapped global id -> that dense row; the kernel's
+        ``expert_map`` indirection needs no such densification; it already
+        resolves an arbitrary "local" index per global id (used elsewhere for
+        expert-parallel sharding), so mapping straight to the pool slot and
+        pointing ``param.data`` at the whole pool (constant across waves) is
+        equally valid and skips the gather kernels entirely --
+        `_prepare_expert_assignment` pads/sizes its per-expert blocks off
+        ``global_num_experts``, not ``local_num_experts``, so a larger
+        (pool-sized) local weight tensor
+        does not add per-token compute. Safe under the existing residency
+        invariants: eviction can never touch a slot this wave's ``gids``
+        occupy (the whole step's working set is pinned before any load), and
+        the fork-event/`_wait_for_pending_prefetch` discipline already
+        guarantees a slot is never overwritten while a still-in-flight kernel
+        from an earlier wave/layer might read it -- both apply identically
+        whether the kernel reads a gathered copy or the pool slot itself.
+
+        P7.12: the ``_expert_map`` buffer is refilled in place (one persistent
+        tensor per layer, allocated in ``build_pool``) rather than allocated
+        fresh and re-registered every call -- safe for the same single-stream,
+        program-order reason the pool-slot indirection above is (see the
+        `_expert_map_buf` field docstring for the one known caveat, LoRA's
+        aux-stream schedule).
+        """
         module = self.layer_module[layer]
-        k = len(gids)
-        expert_map = torch.full(
-            (self.global_num_experts,), -1, dtype=torch.int32, device=self.device
-        )
-        for j, g in enumerate(gids):
-            slot = self.key_to_slot[(layer, g)]
-            for name in self.param_names:
-                self.compute_buf[name][j].copy_(
-                    self.pool[name][slot], non_blocking=self._cuda
-                )
-            expert_map[g] = j
+        expert_map = self._expert_map_buf[layer]
+        expert_map.fill_(-1)
+        if gids:
+            slots = torch.tensor(
+                [self.key_to_slot[(layer, g)] for g in gids],
+                dtype=torch.int32,
+                device=self.device,
+            )
+            gid_tensor = torch.tensor(gids, dtype=torch.long, device=self.device)
+            expert_map[gid_tensor] = slots
         for name in self.param_names:
-            getattr(module, name).data = self.compute_buf[name][:k]
-        module.local_num_experts = k
-        module.register_buffer("_expert_map", expert_map)
+            getattr(module, name).data = self.pool[name]
+        module.local_num_experts = self.pool_experts
 
     def resident_bytes(self) -> int:
-        # Both the scattered pool and the contiguous compute buffer are GPU-resident.
-        return (self.pool_experts + self.global_num_experts) * self.per_expert_bytes
+        # P7.4 (structural): only the scattered pool is GPU-resident now --
+        # no separate compute buffer.
+        return self.pool_experts * self.per_expert_bytes
 
 
 class ExpertCacheOffloader(BaseOffloader):
@@ -776,6 +1047,10 @@ class ExpertCacheOffloader(BaseOffloader):
         waves: 1 (stall: load all misses then one kernel) or 2 (compute hits while
             fetching misses, then compute misses).
         predict_k: Experts the predictor proposes per upcoming layer for prefetch.
+            ``-1`` (default): auto-size to the observed per-bucket working-set
+            EMA once warmed (else ``num_tokens * top_k``), capped at
+            ``global_num_experts``. ``0`` disables prediction. A
+            positive int is a static override.
         prefetch_horizon: How many layers ahead to prefetch.
         budget_gb: If > 0, assert measured GPU-resident pool bytes are within
             tolerance (memory-parity check). 0 disables.
@@ -790,18 +1065,30 @@ class ExpertCacheOffloader(BaseOffloader):
         eviction_freq_decay: Geometric decay applied to all ``freq`` counts
             every ``_GlobalExpertCache._DECAY_INTERVAL`` steps; 1.0 (default)
             disables decay and reproduces the original never-decaying counts.
+        eviction_policy_prefill: (P7.8) Eviction policy identifier used only
+            for ``bucket == "prefill"`` steps; ``None`` (default) reuses
+            ``eviction_policy`` for both buckets. Prefill's near-full-range
+            horizon protection (P7.3) puts eviction pressure almost entirely
+            on the horizon tier, where recency alone can correlate poorly
+            with per-token need order -- a distinct policy is a candidate for
+            that regime specifically.
+        eviction_distance_weight_prefill: Distance-weight override paired
+            with ``eviction_policy_prefill``; ``None`` (default) reuses
+            ``eviction_distance_weight``. Ignored if
+            ``eviction_policy_prefill`` is unset or ``"mru"``.
         offload_params: Parameter name segments to target (empty = all per-expert
             params of each MoE layer).
     """
 
     _BUDGET_TOLERANCE = 0.15
     _EMA_ALPHA = 0.3
+    _MAX_EVENT_POOL = 256  # P7.12 pooled-Event free-list cap
 
     def __init__(
         self,
         pool_experts: int,
         waves: int = 2,
-        predict_k: int = 0,
+        predict_k: int = -1,
         prefetch_horizon: int = 1,
         budget_gb: float = 0.0,
         eviction_policy: str = "lfu",
@@ -810,6 +1097,8 @@ class ExpertCacheOffloader(BaseOffloader):
         budget_safety: float = 0.9,
         eviction_distance_weight: float = 0.0,
         eviction_freq_decay: float = 1.0,
+        eviction_policy_prefill: str | None = None,
+        eviction_distance_weight_prefill: float | None = None,
         offload_params: set[str] | None = None,
     ):
         if waves not in (1, 2):
@@ -830,6 +1119,20 @@ class ExpertCacheOffloader(BaseOffloader):
         self.predictor = create_predictor(predictor, artifacts_dir=predictor_artifacts)
         self.eviction = create_eviction(
             eviction_policy, distance_weight=eviction_distance_weight
+        )
+        # P7.8: only built when explicitly configured, so `_GlobalExpertCache`
+        # gets `None` (reuse `self.eviction` for prefill too) by default.
+        self.eviction_prefill = (
+            create_eviction(
+                eviction_policy_prefill,
+                distance_weight=(
+                    eviction_distance_weight
+                    if eviction_distance_weight_prefill is None
+                    else eviction_distance_weight_prefill
+                ),
+            )
+            if eviction_policy_prefill is not None
+            else None
         )
         self._eviction_freq_decay = eviction_freq_decay
         self.offload_params = offload_params or set()
@@ -856,7 +1159,19 @@ class ExpertCacheOffloader(BaseOffloader):
         # excludes the wait for the miss-copy between wave 0 and wave 1, so
         # only genuine compute time is summed (see `iter_expert_waves`).
         self._pending_timing: dict[str, deque[tuple[str, int, list]]] = {}
-        self._prev_prefetch_event: "torch.cuda.Event | None" = None
+
+        # In-flight prefetch batches not yet known-complete: (event, keys).
+        # P7.9 -- a FIFO (mirroring `_pending_timing`'s never-discard design)
+        # instead of a single slot, so a batch this step doesn't need is not
+        # force-waited on and not silently dropped either; see
+        # `_wait_for_pending_prefetch`.
+        self._pending_prefetch: deque[tuple["torch.cuda.Event", frozenset]] = deque()
+
+        # P7.12: free-list of reusable wave-compute timing Events (the
+        # highest-volume Event-creation site: up to 2/wave, 2 waves/layer,
+        # 48 layers). Populated by `_release_pooled_events` once a
+        # `_pending_timing` entry holding them is popped (fully consumed).
+        self._event_pool: list["torch.cuda.Event"] = []
 
         # Timing-accuracy diagnostics (2026-07-24): how many compute-timing
         # samples actually fed the EMA (`_timing_resolved_count`), and how
@@ -918,6 +1233,19 @@ class ExpertCacheOffloader(BaseOffloader):
         }
         self._pass_count = 0
         self._STATS_LOG_INTERVAL = 50
+
+        # Per-bucket EMA of the observed true working-set size
+        # (`len(unique(topk_ids))`), fed once per layer-step. Used by
+        # `_effective_predict_k`'s auto sizing once warmed, in place of the
+        # raw `num_tokens * top_k` upper bound -- which overshoots badly at
+        # high batch (measured 64 proposed vs 36.2 truly needed at batch=8)
+        # and, per the Phase 7 P7.1 measurement, drives a real ITL/TPOT
+        # regression from moving far more experts through the cache than
+        # actually needed.
+        self._working_set_ema: dict[str, float | None] = {
+            "prefill": None,
+            "decode": None,
+        }
 
         # Prefetch-budget diagnostics: WHY did prefetch_loaded end up where it
         # did this step? Disambiguates "the predictor/queue ran out of
@@ -1040,6 +1368,7 @@ class ExpertCacheOffloader(BaseOffloader):
                     eviction=self.eviction,
                     per_expert_bytes=per_expert_bytes,
                     freq_decay=self._eviction_freq_decay,
+                    eviction_prefill=self.eviction_prefill,
                 )
             elif shapes != expert_shapes:
                 raise NotImplementedError(
@@ -1105,15 +1434,21 @@ class ExpertCacheOffloader(BaseOffloader):
         )
         logger.info_once(
             "[ExpertCacheOffloader] Global pool: %d experts across %d MoE layers "
-            "(waves=%d, predict_k=%d, horizon=%d, eviction=%s, predictor=%s, "
+            "(waves=%d, predict_k=%s, horizon=%d, eviction=%s, "
+            "eviction_prefill=%s, predictor=%s, "
             "PCIe~%.3f ms/expert). Full expert weights in CPU pinned memory: "
             "%.4f GB. GPU-resident pool: %.4f GB.",
             self.pool_experts,
             len(self._layer_order),
             self.waves,
-            self.predict_k,
+            "auto" if self.predict_k < 0 else self.predict_k,
             self.prefetch_horizon,
             type(self.eviction).__name__,
+            (
+                type(self.eviction_prefill).__name__
+                if self.eviction_prefill is not None
+                else "(same)"
+            ),
             type(self.predictor).__name__,
             self._t_per_expert_ms,
             full_gb,
@@ -1139,7 +1474,13 @@ class ExpertCacheOffloader(BaseOffloader):
 
         Best-effort from the forward context; falls back to num_tokens vs
         num_reqs, then to a single-token heuristic (safe in tests with no
-        forward context)."""
+        forward context). Prefers `max_query_len` (> 1 means at least one
+        request in this batch is multi-token, i.e. a prefill/prefill-chunk;
+        pure decode is query_len==1 per request) over `num_prefill_tokens`:
+        on FlashAttentionMetadata (this project's default backend) that
+        field is only populated under decode-context-parallelism and
+        otherwise silently stays 0, which reads as "no prefill" and
+        misclassified every step as decode."""
         num_tokens = topk_ids.shape[0]
         try:
             from vllm.forward_context import get_forward_context
@@ -1149,6 +1490,9 @@ class ExpertCacheOffloader(BaseOffloader):
                 md = md[0] if md else None
             if isinstance(md, dict) and md:
                 md = next(iter(md.values()))
+            mql = getattr(md, "max_query_len", None)
+            if mql is not None:
+                return "prefill" if mql > 1 else "decode"
             npt = getattr(md, "num_prefill_tokens", None)
             if npt is not None:
                 return "prefill" if npt > 0 else "decode"
@@ -1171,7 +1515,44 @@ class ExpertCacheOffloader(BaseOffloader):
         horizon = min(self.prefetch_horizon, max(0, n - 1))
         return [(cur_idx + offset) % n for offset in range(1, horizon + 1)]
 
-    def _predict_upcoming(self, cur_idx: int) -> list[Key]:
+    def _update_working_set_ema(self, bucket: str, n: int) -> None:
+        prev = self._working_set_ema[bucket]
+        self._working_set_ema[bucket] = (
+            float(n)
+            if prev is None
+            else (1 - self._EMA_ALPHA) * prev + self._EMA_ALPHA * n
+        )
+
+    def _effective_predict_k(self, num_tokens: int, top_k: int, bucket: str) -> int:
+        """Resolve `self.predict_k` to the k actually queried this step.
+
+        `-1` (auto, default): size to the per-bucket EMA of the *observed*
+        true working-set size (`len(unique(topk_ids))`, tracked by
+        `_update_working_set_ema`) once warmed, capped at `global_num_experts`
+        as a hard ceiling. Falls back to the raw upper bound
+        (`num_tokens * top_k`) before the EMA has a first sample. The raw
+        bound alone overshoots badly at high batch (measured 64 proposed vs
+        36.2 truly needed at batch=8) -- harmless for prediction accuracy
+        (the horizon/queue just gets some already-resident padding) but not
+        harmless for cost: the Phase 7 P7.1 measurement found it drove a real
+        ITL/TPOT regression at batch>=4 from moving several times more
+        experts through eviction-protection and prefetch than the step
+        actually needed. Tracking the observed size instead closes most of
+        that gap while preserving the batch-awareness that made batch=2
+        (where the two bounds coincide) a clean win. `0` disables prediction
+        outright; a positive int is a static override, mainly for ablation.
+        """
+        if self.predict_k >= 0:
+            return self.predict_k
+        raw_bound = num_tokens * top_k
+        ema = self._working_set_ema.get(bucket)
+        want = raw_bound if ema is None else min(raw_bound, round(ema))
+        cap = self._cache.global_num_experts if self._cache is not None else None
+        return min(cap, want) if cap is not None else want
+
+    def _predict_upcoming(
+        self, cur_idx: int, k: int, bucket: str = "decode"
+    ) -> list[Key]:
         """Query the predictor for the upcoming layers ONCE per step, returned
         in priority order (nearest layer first, predictor order within a
         layer) so `_issue_prefetch` can truncate to the transfer budget
@@ -1179,30 +1560,63 @@ class ExpertCacheOffloader(BaseOffloader):
         (`set(...)`) and the prefetch queue (`deque(...)`) -- derive from this
         single call, so a costly predictor (e.g. the hybrid MLP) runs at most
         once per (layer, step) rather than once each in `_horizon_keys` and
-        `_issue_prefetch`."""
+        `_issue_prefetch`.
+
+        P7.3 (prefill stream-ahead): during a `bucket == "prefill"` step, a
+        chunk touches nearly every expert of the upcoming layer anyway (prefill
+        hit_rate measured ~0.38-0.58), so predicting a *subset* is close to
+        worthless and the MLP forward is pure waste on a large token count
+        (this also delivers P7.10's benefit -- the predictor is never invoked
+        during prefill). Bypass the predictor entirely and enqueue *every*
+        expert of each upcoming layer instead; `_transfer_budget`'s prefill
+        bucket already sizes to the much larger prefill compute window (once
+        warmed), so the actual amount fetched is still budget-limited, not
+        request-limited. `predict_k == 0` (prediction explicitly disabled)
+        still means "predict nothing", even in prefill.
+        """
         keys: list[Key] = []
+        use_full_range = (
+            bucket == "prefill" and self.predict_k != 0 and self._cache is not None
+        )
         for tl in self._upcoming_layers(cur_idx):
             lname = self._layer_order[tl]
-            for g in self.predictor.predict(tl, self.predict_k):
+            ids = (
+                range(self._cache.global_num_experts)
+                if use_full_range
+                else self.predictor.predict(tl, k)
+            )
+            for g in ids:
                 keys.append((lname, g))
         return keys
 
-    def _horizon_keys(self, cur_idx: int) -> set[Key]:
-        return set(self._predict_upcoming(cur_idx))
+    def _horizon_keys(self, cur_idx: int, k: int | None = None) -> set[Key]:
+        if k is None:
+            # No token-count context here to resolve "auto" (-1); only a
+            # concrete predict_k is meaningful without it.
+            k = self.predict_k if self.predict_k >= 0 else 0
+        return set(self._predict_upcoming(cur_idx, k))
 
     def _effective_t_per_expert_ms(self) -> float:
         """The transfer-cost estimate `_transfer_budget` actually uses.
 
-        Prefers the live, continuously-updated EMA of real H2D transfer time
-        (`_GlobalExpertCache.real_ms_per_expert_ema`, fed by real loads issued
-        during serving) over the once-at-startup `_calibrate_pcie` snapshot.
-        Measured (2026-07-24, exp12): the startup calibration was ~16% slower
-        than reality (0.446 vs 0.373 ms/expert measured live), so this
-        removes a systematic source of overly conservative budgeting. Falls
-        back to the static calibration until the live EMA has a first sample
-        (there is always at least the startup value once `_calibrate_pcie`
-        has run, so this is only `<= 0` before that)."""
+        Prefers, in order: (1) the P7.5 fitted marginal rate
+        (`_transfer_marginal_ms_ema`, the slope of an `elapsed = fixed +
+        marginal * n` regression over real transfer-timing samples) -- plain
+        `elapsed / n` (what `real_ms_per_expert_ema` computes) folds fixed
+        per-batch overhead into the marginal rate, systematically
+        overestimating it on the small batches this cache usually transfers,
+        which under-sizes the budget and keeps batches small (a
+        self-reinforcing pessimism loop); (2) the live EMA of real H2D
+        transfer time (`real_ms_per_expert_ema`) once it has a sample but
+        before the regression is well-conditioned; (3) the once-at-startup
+        `_calibrate_pcie` snapshot. Measured (2026-07-24, exp12): the startup
+        calibration was ~16% slower than reality (0.446 vs 0.373 ms/expert
+        measured live), so falling through to the live EMA already removes a
+        systematic source of overly conservative budgeting; the regression
+        removes a further, similarly-shaped bias in the EMA itself."""
         cache = self._cache
+        if cache is not None and cache._transfer_marginal_ms_ema is not None:
+            return cache._transfer_marginal_ms_ema
         if cache is not None and cache.real_ms_per_expert_ema is not None:
             return cache.real_ms_per_expert_ema
         return self._t_per_expert_ms
@@ -1266,6 +1680,25 @@ class ExpertCacheOffloader(BaseOffloader):
                 + self._EMA_ALPHA * last_per_tok
             )
             self._timing_resolved_count[bucket] += 1
+            self._release_pooled_events(events)
+
+    def _get_pooled_event(self) -> "torch.cuda.Event":
+        """P7.12: pop a reusable timing-enabled Event instead of allocating a
+        fresh one for every wave (`_wave_events` creates up to 2 per wave,
+        up to 2 waves per layer, 48 layers -- the highest-volume Event site
+        in this class). Safe to reuse only once a pending `_pending_timing`
+        entry holding it has been popped (its `elapsed_time()` already read),
+        which is exactly when `_release_pooled_events` returns it here."""
+        if self._event_pool:
+            return self._event_pool.pop()
+        return torch.cuda.Event(enable_timing=True)
+
+    def _release_pooled_events(self, events: list[tuple]) -> None:
+        for start, end in events:
+            if len(self._event_pool) < self._MAX_EVENT_POOL:
+                self._event_pool.append(start)
+            if len(self._event_pool) < self._MAX_EVENT_POOL:
+                self._event_pool.append(end)
 
     def _consume_gap_timing(self) -> None:
         pending = self._pending_gap_timing
@@ -1283,6 +1716,32 @@ class ExpertCacheOffloader(BaseOffloader):
             )
             self._gap_resolved_count[bucket] += 1
 
+    def _wait_for_pending_prefetch(self, needed_keys: set[Key]) -> None:
+        """Wait only for in-flight prefetch batches this step will actually
+        publish (read via a main-stream D2D copy out of the pool) -- not a
+        blanket wait on every previous prefetch (P7.9). Pending batches are a
+        FIFO (mirroring `_pending_timing`'s never-discard design): copy-stream
+        ops complete in program order, so waiting on the newest intersecting
+        entry also guarantees every earlier-enqueued entry is done, and all of
+        them (through that index) can be dropped. Entries confirmed complete
+        via `event.query()` are dropped opportunistically first, with no wait
+        cost, keeping the deque from growing across steps that consistently
+        miss."""
+        pending = self._pending_prefetch
+        while pending and pending[0][0].query():
+            pending.popleft()
+        if not pending:
+            return
+        match_idx = -1
+        for i, (_, keys) in enumerate(pending):
+            if keys & needed_keys:
+                match_idx = i
+        if match_idx < 0:
+            return
+        torch.cuda.current_stream().wait_event(pending[match_idx][0])
+        for _ in range(match_idx + 1):
+            pending.popleft()
+
     def iter_expert_waves(
         self,
         routed_experts: nn.Module,
@@ -1296,9 +1755,6 @@ class ExpertCacheOffloader(BaseOffloader):
             return
 
         cuda = cache._cuda
-        if cuda and self._prev_prefetch_event is not None:
-            torch.cuda.current_stream().wait_event(self._prev_prefetch_event)
-            self._prev_prefetch_event = None
         self._consume_timing(layer)
         self._consume_gap_timing()
         if cuda:
@@ -1315,8 +1771,37 @@ class ExpertCacheOffloader(BaseOffloader):
         cur_idx = self._layer_index[layer]
         bucket = self._batch_bucket(topk_ids)
         num_tokens = topk_ids.shape[0]
+        top_k = topk_ids.shape[1] if topk_ids.dim() > 1 else 1
 
-        needed = torch.unique(topk_ids).tolist()
+        # P7.11: launch the predictor (and `torch.unique`) before
+        # materializing `needed` to a CPU list, so one sync captures both
+        # instead of two separate serialized ones. `observe()` only needs
+        # `hidden_states` (already in scope); the predictor call only needs
+        # `predict_k`/`bucket`/`cur_idx` -- neither depends on `needed`.
+        # CUDA ops on one stream execute in program order, so the
+        # predictor's own sync (the `.tolist()` inside
+        # `HybridExpertPredictor.predict`, when it runs one at all --
+        # bypassed entirely in prefill by P7.3, and a no-op for `first_k`)
+        # transitively waits for the just-queued `unique()` kernel too;
+        # reading `needed` back afterward is then close to free rather than
+        # a second, separate wait. Uses last step's working-set EMA
+        # (one-step-stale, as any EMA read inherently is) since this step's
+        # `len(needed)` isn't known yet at this point.
+        self.predictor.observe(cur_idx, topk_ids, hidden_states)
+        predict_k = self._effective_predict_k(num_tokens, top_k, bucket)
+        needed_gpu = torch.unique(topk_ids)
+        predicted = self._predict_upcoming(cur_idx, predict_k, bucket)
+        horizon = set(predicted)
+
+        needed = needed_gpu.tolist()
+        self._update_working_set_ema(bucket, len(needed))
+        if cuda:
+            # P7.9: only wait for in-flight prefetch batches this step will
+            # actually publish (read via a main-stream D2D copy) -- not a
+            # blanket wait on every previous prefetch, which stalled the
+            # *entire* next layer even when it touched none of the
+            # prefetched slots.
+            self._wait_for_pending_prefetch({(layer, g) for g in needed})
         resident = {g for g in needed if cache.is_resident(layer, g)}
         hits, misses = split_hits_misses(resident, needed)
         cache.bump(layer, needed)
@@ -1325,15 +1810,11 @@ class ExpertCacheOffloader(BaseOffloader):
         self.bucket_stats[bucket]["hits"] += len(hits)
         self.bucket_stats[bucket]["misses"] += len(misses)
 
-        self.predictor.observe(cur_idx, topk_ids, hidden_states)
-
         # Reserve the whole current-iteration working set before any eviction.
         cache.pin_step({(layer, g) for g in needed})
-        # Single predictor query per step; horizon (eviction protection) and the
-        # prefetch queue both derive from it.
-        predicted = self._predict_upcoming(cur_idx)
-        horizon = set(predicted)
-        miss_event = cache.load([(layer, g) for g in misses], horizon, cur_idx)
+        miss_event = cache.load(
+            [(layer, g) for g in misses], horizon, cur_idx, bucket
+        )
         self.bytes_streamed += len(misses) * cache.per_expert_bytes
 
         # Each wave gets its own (start, end) event pair bracketing only its
@@ -1348,12 +1829,17 @@ class ExpertCacheOffloader(BaseOffloader):
         def _wave_events() -> tuple:
             if not cuda:
                 return None, None
-            return (
-                torch.cuda.Event(enable_timing=True),
-                torch.cuda.Event(enable_timing=True),
-            )
+            return (self._get_pooled_event(), self._get_pooled_event())  # P7.12
 
-        if self.waves == 1 or not hits:
+        if self.waves == 1 or not hits or not misses:
+            # Single-wave path: waves=1 (stall), no hits (everything must be
+            # fetched, a wave-0-over-hits would be empty), or no misses
+            # (everything already resident, a wave-1-over-misses would
+            # publish nothing and compute a redundant all-zero contribution)
+            # -- all three run one kernel over `needed` (== hits when
+            # misses is empty). `miss_event` is always None when misses is
+            # empty (`_GlobalExpertCache.load` short-circuits on no keys to
+            # load), so the wait below is already a no-op in that case.
             if cuda and miss_event is not None:
                 torch.cuda.current_stream().wait_event(miss_event)
             start_ev, end_ev = _wave_events()
@@ -1441,12 +1927,12 @@ class ExpertCacheOffloader(BaseOffloader):
             self.prefetch_queue_exhausted[bucket] += 1
         if not batch:
             return
-        ev = self._cache.load(batch, horizon, cur_layer_idx)
+        ev = self._cache.load(batch, horizon, cur_layer_idx, bucket)
         self.prefetch_loaded += len(batch)
         self.bucket_stats[bucket]["prefetch_loaded"] += len(batch)
         self.bytes_streamed += len(batch) * self._cache.per_expert_bytes
         if ev is not None:
-            self._prev_prefetch_event = ev
+            self._pending_prefetch.append((ev, frozenset(batch)))
 
     def _bucket_metrics(self, bucket: str) -> dict[str, float]:
         s = self.bucket_stats[bucket]
@@ -1506,9 +1992,12 @@ class ExpertCacheOffloader(BaseOffloader):
     def _transfer_calibration_stats(self) -> dict[str, float]:
         """Accuracy diagnostics for the transfer-time input to
         `_transfer_budget`: the once-at-startup PCIe calibration, the live
-        lifetime average, and the EMA `_transfer_budget` actually uses (see
+        lifetime average, the P7.5 fitted fixed/marginal regression terms,
+        and the value `_transfer_budget` actually uses (see
         `_effective_t_per_expert_ms`) -- these can differ since the EMA
-        weights recent samples more than the lifetime average does."""
+        weights recent samples more than the lifetime average does, and the
+        regression's marginal term further removes the fixed-cost bias
+        `elapsed / n` folds into the plain EMA."""
         cache = self._cache
         real_count = cache.real_transfer_expert_count if cache else 0
         return {
@@ -1516,6 +2005,11 @@ class ExpertCacheOffloader(BaseOffloader):
             "real_avg_ms_per_expert": (
                 cache.real_transfer_ms_sum / real_count if cache and real_count else 0.0
             ),
+            "fitted_marginal_ms_per_expert": (
+                cache._transfer_marginal_ms_ema if cache else None
+            )
+            or 0.0,
+            "fitted_fixed_ms": (cache._transfer_fixed_ms_ema if cache else None) or 0.0,
             "effective_ms_per_expert": self._effective_t_per_expert_ms(),
             "real_sample_experts": real_count,
         }
@@ -1584,13 +2078,15 @@ class ExpertCacheOffloader(BaseOffloader):
             "ema_ms_per_tok=%.4f last_wave_ms_per_tok=%.4f "
             "gap_ema_ms=%.4f (gap_resolved=%d) | "
             "transfer: startup_ms_per_expert=%.4f "
-            "real_avg_ms_per_expert=%.4f effective_ms_per_expert=%.4f (n=%d)",
+            "real_avg_ms_per_expert=%.4f fitted_marginal_ms_per_expert=%.4f "
+            "fitted_fixed_ms=%.4f effective_ms_per_expert=%.4f (n=%d)",
             self._pass_count,
             td["resolved"], td["would_have_discarded"],
             td["would_have_discarded_rate"], td["current_ema_ms_per_token"],
             td["current_last_wave_ema_ms_per_token"],
             td["current_gap_ema_ms"], td["gap_resolved"],
             xfer["startup_ms_per_expert"], xfer["real_avg_ms_per_expert"],
+            xfer["fitted_marginal_ms_per_expert"], xfer["fitted_fixed_ms"],
             xfer["effective_ms_per_expert"], xfer["real_sample_experts"],
         )
 

@@ -542,6 +542,12 @@ class EngineArgs:
     expert_cache_eviction_freq_decay: float = (
         ExpertCacheOffloadConfig.eviction_freq_decay
     )
+    expert_cache_eviction_policy_prefill: str | None = (
+        ExpertCacheOffloadConfig.eviction_policy_prefill
+    )
+    expert_cache_eviction_distance_weight_prefill: float | None = (
+        ExpertCacheOffloadConfig.eviction_distance_weight_prefill
+    )
     expert_cache_params: set[str] = get_field(
         ExpertCacheOffloadConfig, "offload_params"
     )
@@ -1296,6 +1302,14 @@ class EngineArgs:
         offload_group.add_argument(
             "--expert-cache-eviction-freq-decay",
             **expert_cache_kwargs["eviction_freq_decay"],
+        )
+        offload_group.add_argument(
+            "--expert-cache-eviction-policy-prefill",
+            **expert_cache_kwargs["eviction_policy_prefill"],
+        )
+        offload_group.add_argument(
+            "--expert-cache-eviction-distance-weight-prefill",
+            **expert_cache_kwargs["eviction_distance_weight_prefill"],
         )
         offload_group.add_argument(
             "--expert-cache-predictor",
@@ -2432,6 +2446,10 @@ class EngineArgs:
                 eviction_policy=self.expert_cache_eviction_policy,
                 eviction_distance_weight=self.expert_cache_eviction_distance_weight,
                 eviction_freq_decay=self.expert_cache_eviction_freq_decay,
+                eviction_policy_prefill=self.expert_cache_eviction_policy_prefill,
+                eviction_distance_weight_prefill=(
+                    self.expert_cache_eviction_distance_weight_prefill
+                ),
                 predictor=self.expert_cache_predictor,
                 predictor_artifacts=self.expert_cache_predictor_artifacts,
                 budget_safety=self.expert_cache_budget_safety,

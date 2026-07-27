@@ -109,9 +109,21 @@ class ExpertCacheOffloadConfig:
     break. The old per-wave streaming scratch no longer exists (misses stream
     directly into the shared pool); this value is ignored."""
 
-    predict_k: int = Field(default=0, ge=0)
+    predict_k: int = Field(default=-1, ge=-1)
     """Number of experts the predictor proposes per upcoming layer for
-    prefetch. Default 0 disables prefetch prediction."""
+    prefetch. `-1` (default, auto): size to a per-bucket (prefill/decode)
+    EMA of the *observed* true working-set size (`len(unique(topk_ids))`)
+    once warmed, falling back to the raw upper bound (`num_tokens * top_k`)
+    before that -- always capped at the model's experts/layer. A static k
+    under-covers larger batches (measured 107%/64%/44% coverage of the true
+    working set at batch 2/4/8 with the old static default of 16, degrading
+    both eviction-horizon protection and prefetch-queue supply as batch size
+    grows); the raw upper bound alone overshoots it (64 proposed vs 36.2
+    truly needed at batch=8), which measurably cost ITL/TPOT by moving more
+    experts through the cache than needed -- tracking the observed size
+    instead closes most of that gap. `0` disables prefetch prediction
+    entirely. A positive integer is a static override, mainly for ablation.
+    """
 
     prefetch_horizon: int = Field(default=1, ge=0)
     """How many layers ahead to prefetch predicted experts. 0 disables
@@ -174,6 +186,24 @@ class ExpertCacheOffloadConfig:
     (see `_GlobalExpertCache._DECAY_INTERVAL`). 1.0 (default) disables decay,
     reproducing the original never-decaying lifetime counts. Ignored by
     "lru"/"mru"."""
+
+    eviction_policy_prefill: EvictionPolicy | None = None
+    """(P7.8) Eviction policy used only for steps that contain at least one
+    prefill token; `None` (default) reuses `eviction_policy` for both
+    prefill and decode, preserving prior behavior. During prefill, a chunk
+    touches nearly every expert of the upcoming layer (see
+    `predict_k`/prefetch stream-ahead), which puts eviction pressure almost
+    entirely on the predicted-soon ("horizon") tier -- a regime where plain
+    recency (as `eviction_policy="lru"`'s tie-break) can correlate poorly
+    with each expert's actual per-token need order. Set to try a distinct
+    policy (e.g. "mru") for that regime specifically."""
+
+    eviction_distance_weight_prefill: float | None = Field(
+        default=None, ge=0, le=1
+    )
+    """Distance-weight override paired with `eviction_policy_prefill`; `None`
+    (default) reuses `eviction_distance_weight`. Ignored if
+    `eviction_policy_prefill` is unset or "mru"."""
 
     offload_params: set[str] = Field(default_factory=set)
     """The set of parameter name segments to target for expert caching.
